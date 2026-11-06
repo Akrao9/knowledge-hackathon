@@ -28,11 +28,11 @@ PROJECTED_BRANCHES = re.compile(
 )
 BRANCH_COUNT_QUESTION = re.compile(
     r"\bbranch count\b|\b(?:how many|number of|count (?:of|the))\b.*"
-    r"\b(?:branches|branch offices|branch(?: office)? locations)\b",
+    r"\b(?:branches|branch offices|branch(?: office)? locations|locations|offices)\b",
     re.IGNORECASE,
 )
 MEMBERSHIP_QUESTION = re.compile(
-    r"\b(?:eligible|eligibility|qualify|who (?:can|may)|requirements?)\b.*\b(?:join|member(?:ship)?)\b"
+    r"\b(?:eligible|eligibility|qualify|who (?:can|may|is allowed to)|allowed to|requirements?)\b.*\b(?:join|member(?:ship)?)\b"
     r"|\bmembership\b.*\b(?:eligible|eligibility|qualify|requirements?)\b", re.IGNORECASE,
 )
 JOIN_SECTION = re.compile(r"^#{1,6}[^\n]*eligible to join[^\n]*\n(.*?)(?=^#{1,6}\s|\Z)", re.I | re.M | re.S)
@@ -197,7 +197,9 @@ class SnapshotFacts:
                     text=f"Dupaco reports {current.count} branch office locations.", sources=[current.source],
                     conflict_note=BRANCH_REASON if self._competing_projection(current) else None,
                 )
-        if MEMBERSHIP_QUESTION.search(question) and not re.search(r"\b(?:grants?|scholarships?|loans?)\b", question, re.I):
+        # "Who can join the Key City Creative Center?" asks about another organization.
+        other_group = re.search(r"\bjoin\s+(?:the\s+)?(?!Dupaco\b)[A-Z]", question)
+        if MEMBERSHIP_QUESTION.search(question) and not other_group and not re.search(r"\b(?:grants?|scholarships?|loans?)\b", question, re.I):
             membership = self._membership_answer()
             if membership:
                 return membership

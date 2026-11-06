@@ -2,8 +2,10 @@
 import os
 import re
 import sys
+from calendar import monthrange
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import date
 from math import log1p
 from pathlib import Path
 from typing import Optional
@@ -14,8 +16,8 @@ _HARNESS = next((d / "harness" for d in Path(__file__).resolve().parents if (d /
 if _HARNESS is not None and str(_HARNESS) not in sys.path:
     sys.path.insert(0, str(_HARNESS))
 from contract import Answer, Conflict, Snapshot, Source  # noqa: E402
-from luna import select_evidence  # noqa: E402
-from rate_tables import RateIndex  # noqa: E402
+from luna import select_passages  # noqa: E402
+from rate_tables import RateIndex, is_rate_lookup  # noqa: E402
 from snapshot_facts import SnapshotFacts  # noqa: E402
 
 RANK_WORD = re.compile(r"[a-z0-9]+")
@@ -25,6 +27,11 @@ MAX_FALLBACK_CHARS = 600
 STOP_WORDS = frozenset(
     "a an and are as at be can could did do does for from how i in is it me my of on or s "
     "tell that the their this to was were what when where which who will with would you your".split()
+    # Words that only frame a question; matching them pulls in unrelated articles.
+    + "about also any generally get give going got has have know like need now offer offered offers please provide "
+    "typically use using usually want way work".split()
+    # Leftovers of contractions such as "I'm", "we'll" and "don't".
+    + "d ll m re t ve".split()
 )
 WORD_FORMS = {
     "accounts": "account",
@@ -51,6 +58,17 @@ HOURS_DAY = re.compile(
 )
 HOURS_QUESTION = re.compile(r"\b(?:hours|what time)\b", re.IGNORECASE)
 HOURS_SERVICE = re.compile(r"\b(lobby|drive[- ]up)\b", re.IGNORECASE)
+TABLE_LINE = re.compile(r"^\s*\|")
+TABLE_RULE = re.compile(r"^[\s|:-]*-{3}[\s|:-]*$")
+BLANK_LINES = re.compile(r"\n\s*\n(?:\s*\n)+")
+MARKDOWN_IMAGE = re.compile(r"!\[[^\]\n]*\]\([^)\s]*\)")
+TEASER_HEADINGS = frozenset({"Handpicked for You"})
+LINKED_ITEM = re.compile(r"^(?:[-*+]|\d+\\?\.)\s+\[")
+LINKED_HEADING = re.compile(r"^\**\[[^\]\n]+\]\((\S+?)(?:\s+\"[^\"]*\")?\)\**$")
+# Articles, press releases and calculators explain or announce; product pages state current terms.
+ARTICLE_PATHS = ("/learn/", "/newsroom/", "/business/resources/", "/business-resources/", "/calculators/", "/hubfs/")
+DATED_PATH = re.compile(r"^/(?:19|20)\d{2}/")
+ARTICLE_WEIGHT = 0.6
 MARKDOWN_LINK = re.compile(r"(?<!!)\[([^\]\n]+)\]\(([^)\s]+)\)")
 LINK_QUESTION = re.compile(r"\b(?:link|url)\b", re.IGNORECASE)
 LINK_WORDS = frozenset("dupaco link look see show should use url view web website".split())
@@ -68,6 +86,14 @@ PLACE_STOP_WORDS = frozenset(
     "monday tuesday wednesday thursday friday saturday sunday holiday holidays morning afternoon evening".split()
 )
 STREET_WORDS = {"ave": "avenue", "st": "street", "rd": "road", "dr": "drive", "blvd": "boulevard", "ln": "lane"}
+MONTHS = {name: number for number, name in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), start=1)}
+# "as of May 2026", "as of May 15, 2026", "as of 2026-05-15", "as of 5/15/2026"
+AS_OF_DATE = re.compile(
+    r"\bas of\s+(?:(?P<month>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+"
+    r"(?:(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+)?(?P<year>(?:19|20)\d{2})"
+    r"|(?P<iso>(?:19|20)\d{2}-\d{2}-\d{2})|(?P<us_month>\d{1,2})/(?P<us_day>\d{1,2})/(?P<us_year>(?:19|20)\d{2}))\b",
+    re.IGNORECASE,
+)
 COMPARISON = re.compile(
     r"\bcompare\b|\b(?:all|every|each)\b.{0,100}\b(?:same|identical)\b|\b(?:same|identical)\b.{0,60}\b(?:all|every|each)\b"
     r"|\b(?:differ|vary)\b.{0,60}\b(?:by|between|across|from)\b",
@@ -92,6 +118,28 @@ def _rank_terms(text: str, *, phrases: bool = False) -> set[str]:
     if phrases:
         terms.update(f"{left} {right}" for left, right in zip(words, words[1:]))
     return terms
+
+
+def _is_teaser(url: str, headings: tuple[str, ...], text: str) -> bool:
+    """Blurbs that advertise other articles ("Handpicked for You", "Keep reading", card titles linking away)."""
+    if any(heading in TEASER_HEADINGS for heading in headings) or "[Keep reading](" in text:
+        return True
+    card = LINKED_HEADING.match(headings[-1]) if headings else None
+    return bool(card) and urlsplit(card[1]).path.rstrip("/") != urlsplit(url).path.rstrip("/")
+
+
+def _has_prose(passage: str) -> bool:
+    """True unless the passage is only images and links, or a bulleted list of links to other pages."""
+    lines = [line.strip() for line in passage.splitlines() if line.strip()]
+    if len(lines) >= 2 and all(LINKED_ITEM.match(line) for line in lines):
+        return False
+    stripped = MARKDOWN_LINK.sub("", MARKDOWN_IMAGE.sub("", passage))
+    return len(RANK_WORD.findall(stripped.lower())) >= 4
+
+
+def _is_article(url: str) -> bool:
+    path = urlsplit(url).path
+    return path.startswith(ARTICLE_PATHS) or bool(DATED_PATH.match(path))
 
 
 def _markdown_sections(markdown: str) -> Iterator[tuple[tuple[str, ...], str]]:
@@ -202,16 +250,35 @@ def _rank_links(question: str, links: list[Section]) -> list[Section]:
 def _with_subject(question: str, section: Section, quote: str) -> str:
     """Name the product or topic when a prose quote answers without saying what it is about.
 
-    The section heading is added only if it carries question words the quote lacks, and never when it
-    contains a number, so a heading cannot add a stale figure or year to the answer.
+    The nearest heading above the quote that carries question words the quote lacks is added, so a
+    "Flexible Repayment" paragraph on the student loan page is named by the page's own heading. A
+    heading with a number or a link is never used, so it cannot add a stale figure or year to the answer.
     """
-    heading = (section.heading_path[-1] if section.heading_path else section.page_title).strip("*# ")
-    if section.link_target or not heading or quote.lstrip().startswith(("|", "**")) or any(char.isdigit() for char in heading):
+    if section.link_target or quote.lstrip().startswith(("|", "**")):
         return quote
-    question_terms = _rank_terms(question)
-    if (question_terms & _rank_terms(heading)) - _rank_terms(quote):
-        return f"{heading}: {quote}"
+    missing = _rank_terms(question) - _rank_terms(quote)
+    for heading in reversed(section.heading_path or (section.page_title,)):
+        heading = heading.strip("*# ")
+        if not heading or "](" in heading or any(char.isdigit() for char in heading):
+            continue
+        if missing & _rank_terms(heading):
+            return f"{heading}: {quote}"
     return quote
+
+
+def _numbered_passages(section: Section) -> list[str]:
+    """The pieces of a section Luna can choose: a short section whole, a long one by paragraph and table row."""
+    text = section.text[:MAX_SECTION_CHARS]
+    if len(text) <= MAX_FALLBACK_CHARS:
+        return [text.strip()]
+    pieces = []
+    for paragraph in text.split("\n\n"):
+        lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+        if lines and all(TABLE_LINE.match(line) for line in lines):
+            pieces.extend(line for line in lines if not TABLE_RULE.fullmatch(line))
+        elif lines:
+            pieces.append(paragraph.strip())
+    return pieces
 
 
 def _quote_answer(question: str, evidence: list[tuple[Section, str]]) -> Answer:
@@ -220,18 +287,38 @@ def _quote_answer(question: str, evidence: list[tuple[Section, str]]) -> Answer:
     sources = []
     seen = set()
     for section, quote in evidence:
-        key = tuple(RANK_WORD.findall(quote.lower()))
-        if key in seen:
+        # Images say nothing to a member reading the answer; the source keeps the quote as published.
+        shown = BLANK_LINES.sub("\n\n", MARKDOWN_IMAGE.sub("", quote)).strip()
+        key = tuple(RANK_WORD.findall(shown.lower()))
+        if not shown or key in seen:
             continue
         seen.add(key)
         if section.link_target and section.link_target not in quote:
             quotes.append(f"[View page]({section.link_target})")
         else:
-            quotes.append(_with_subject(question, section, quote))
+            quotes.append(_with_subject(question, section, shown))
         sources.append(Source(url=section.url, snapshot_id=section.snapshot_id, quote=quote))
         if len(quotes) == limit:
             break
     return Answer(text="\n\n".join(quotes), sources=sources)
+
+
+def _question_date(question: str) -> Optional[str]:
+    """The date a question asks about in its own words, if any; "as of May 2026" means the end of May."""
+    match = AS_OF_DATE.search(question)
+    if not match:
+        return None
+    if match["iso"]:
+        year, month, day = (int(part) for part in match["iso"].split("-"))
+    elif match["us_year"]:
+        year, month, day = int(match["us_year"]), int(match["us_month"]), int(match["us_day"])
+    else:
+        year, month = int(match["year"]), MONTHS[match["month"][:3].lower()]
+        day = int(match["day"]) if match["day"] else monthrange(year, month)[1]
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None
 
 
 def _place_words(text: str) -> set[str]:
@@ -263,8 +350,13 @@ def _supports_hours(question: str, passage: str) -> bool:
     return any(HOURS_DAY.match(line.lstrip()) for line in schedule.splitlines())
 
 
-def _ranked_passages(question: str, sections: list[Section]) -> Iterator[tuple[int, Section, str]]:
-    """Yield passages that share enough words with the question, in section rank order."""
+def _ranked_passages(
+    question: str, sections: list[Section], rarity: dict[str, float]
+) -> Iterator[tuple[float, Section, str]]:
+    """Yield passages that share enough words with the question, in section rank order.
+
+    Each passage is scored by the rarity of the question words it shares.
+    """
     terms = _rank_terms(question)
     place = _named_place(question)
     needs_schedule = place is not None and HOURS_QUESTION.search(question)
@@ -277,34 +369,47 @@ def _ranked_passages(question: str, sections: list[Section]) -> Iterator[tuple[i
             heading_terms = set()
         for passage in passages:
             quote = passage.strip()[:MAX_FALLBACK_CHARS]
-            if not quote or not _mentions(section, place, quote):
+            if not quote or not _has_prose(quote) or not _mentions(section, place, quote):
                 continue
             if needs_schedule and not _supports_hours(question, quote):
                 continue
-            hits = len(terms & (_rank_terms(quote) | heading_terms))
-            if hits >= 2 and hits >= 0.4 * len(terms):
-                yield hits, section, quote
+            shared = terms & (_rank_terms(quote) | heading_terms)
+            if len(shared) >= 2 and len(shared) >= 0.4 * len(terms):
+                yield sum(rarity.get(term, 0) for term in shared), section, quote
 
 
-def _ranked_fallback(question: str, sections: list[Section]) -> Answer:
+def _ranked_fallback(
+    question: str, sections: list[Section], rarity: dict[str, float], product_words: frozenset[str] = frozenset()
+) -> Answer:
+    """The best passage, or "I don't know".
+
+    A rate question reaches search only after the rate index read every table and found no single product,
+    so a table is not quoted again, and the passage must name the words no table used ("signature loan").
+    """
+    skip_rate_rows = is_rate_lookup(question)
     best = None
-    best_hits = 0
-    for hits, section, quote in _ranked_passages(question, sections):
-        if hits > best_hits:
-            best, best_hits = (section, quote), hits
+    best_score = 0.0
+    for score, section, quote in _ranked_passages(question, sections, rarity):
+        if skip_rate_rows and any(TABLE_LINE.match(line) and "%" in line for line in quote.splitlines()):
+            continue
+        named = f"{section.page_title} {' '.join(section.heading_path)} {quote}".lower()
+        if not all(word in named for word in product_words):
+            continue
+        if score > best_score:
+            best, best_score = (section, quote), score
     if best is None:
         return Answer(text="I don't know.", confident=False)
     return _quote_answer(question, [best])
 
 
-def _comparison_answer(question: str, sections: list[Section]) -> Answer:
+def _comparison_answer(question: str, sections: list[Section], rarity: dict[str, float]) -> Answer:
     """Answer "do all branches keep the same hours"-style questions with the top distinct passages.
 
     This runs locally, without the API, so the same question always shows the same passages.
     """
     evidence = []
     seen = set()
-    for _, section, quote in _ranked_passages(question, sections):
+    for _, section, quote in _ranked_passages(question, sections, rarity):
         # Pages type the same schedule with different dashes and spacing; those copies are one passage.
         key = " ".join(quote.replace("–", "-").replace("—", "-").split()).lower()
         if key not in seen:
@@ -321,20 +426,25 @@ class SnapshotKnowledge:
     def __init__(self):
         self.snapshots: list[Snapshot] = []
         self._sections_by_snapshot: dict[str, dict[str, Section]] = {}
-        self._postings_by_snapshot: dict[str, dict[str, dict[str, int]]] = {}
+        self._postings_by_snapshot: dict[str, dict[str, dict[str, float]]] = {}
         self._links_by_snapshot: dict[str, list[Section]] = {}
         self._rates_by_snapshot: dict[str, RateIndex] = {}
         self._facts_by_snapshot: dict[str, SnapshotFacts] = {}
+        self._answers: dict[tuple[str, Optional[str]], Answer] = {}
 
     def ingest(self, snapshot: Snapshot) -> None:
+        self._answers.clear()
         sections: dict[str, Section] = {}
-        postings: dict[str, dict[str, int]] = {}
+        postings: dict[str, dict[str, float]] = {}
         links: list[Section] = []
         for page in snapshot.pages:
             page_path = urlsplit(page.url).path
             page_terms = _rank_terms(f"{page.title} {page_path}")
             path = page_path.rstrip("/")
+            scale = ARTICLE_WEIGHT if _is_article(page.url) else 1
             for headings, text, label in _search_sections(page.markdown, path):
+                if _is_teaser(page.url, headings, text):
+                    continue
                 section_id = f"{snapshot.snapshot_id}:{len(sections) + 1}"
                 heading_path = (*headings, label) if label else headings
                 section = Section(
@@ -351,7 +461,7 @@ class SnapshotKnowledge:
                 for weight, terms in ((3, heading_terms), (2, page_terms), (1, _rank_terms(text))):
                     for term in terms:
                         matches = postings.setdefault(term, {})
-                        matches[section_id] = matches.get(section_id, 0) + weight
+                        matches[section_id] = matches.get(section_id, 0) + weight * scale
         facts = SnapshotFacts(snapshot)
         self._sections_by_snapshot[snapshot.snapshot_id] = sections
         self._postings_by_snapshot[snapshot.snapshot_id] = postings
@@ -370,6 +480,20 @@ class SnapshotKnowledge:
         snapshot = self._snapshot_for(as_of)
         return self._sections_by_snapshot[snapshot.snapshot_id] if snapshot else {}
 
+    def _rarity(self, question: str, snapshot: Snapshot, *, phrases: bool = False) -> dict[str, float]:
+        """How rare each question term is in the snapshot, for terms that occur at all."""
+        count = len(self._sections_by_snapshot[snapshot.snapshot_id])
+        postings = self._postings_by_snapshot[snapshot.snapshot_id]
+        rarity = {}
+        for term in _rank_terms(question, phrases=phrases):
+            matches = postings.get(term)
+            if matches:
+                rarity[term] = log1p((count - len(matches) + 0.5) / (len(matches) + 0.5))
+                if MODEL_YEAR.fullmatch(term):
+                    # The matching table row may express the requested year as a range.
+                    rarity[term] *= 0.25
+        return rarity
+
     def _rank_sections(self, question: str, as_of: Optional[str] = None, limit: int = 8) -> list[Section]:
         """Return sections ranked by term rarity and the fields where each term appears."""
         snapshot = self._snapshot_for(as_of)
@@ -379,23 +503,37 @@ class SnapshotKnowledge:
         sections = self._sections_by_snapshot[snapshot.snapshot_id]
         postings = self._postings_by_snapshot[snapshot.snapshot_id]
         scores: dict[str, float] = {}
-        for term in sorted(_rank_terms(question, phrases=True)):
-            matches = postings.get(term)
-            if not matches:
-                continue
-            rarity = log1p((len(sections) - len(matches) + 0.5) / (len(matches) + 0.5))
-            if MODEL_YEAR.fullmatch(term):
-                # The matching table row may express the requested year as a range.
-                rarity *= 0.25
-            for section_id, weight in matches.items():
+        for term, rarity in sorted(self._rarity(question, snapshot, phrases=True).items()):
+            for section_id, weight in postings[term].items():
                 scores[section_id] = scores.get(section_id, 0) + rarity * weight
 
-        ranked_ids = sorted(scores, key=lambda section_id: (-scores[section_id], section_id))
         links = _rank_links(question, self._links_by_snapshot[snapshot.snapshot_id]) if LINK_QUESTION.search(question) else []
-        remaining = max(0, limit - len(links))
-        return links[:limit] + [sections[section_id] for section_id in ranked_ids[:remaining]]
+        ranked = links[:limit]
+        # The site serves some pages at two URLs; one copy of a section is enough.
+        seen = set()
+        for section_id in sorted(scores, key=lambda section_id: (-scores[section_id], section_id)):
+            if len(ranked) >= limit:
+                break
+            section = sections[section_id]
+            key = (section.heading_path, section.text)
+            if key not in seen:
+                seen.add(key)
+                ranked.append(section)
+        return ranked
 
     def answer(self, question, as_of=None):
+        """Answer from the snapshot for the date; a repeated question gets the answer it got the first time."""
+        key = (question, as_of)
+        if key not in self._answers:
+            self._answers[key] = self._answer(question, as_of)
+        return self._answers[key]
+
+    def _answer(self, question: str, as_of: Optional[str]) -> Answer:
+        if as_of is None:
+            # A date before the first snapshot can't be answered "as of", so the question gets the newest snapshot.
+            asked = _question_date(question)
+            if asked and self._snapshot_for(asked):
+                as_of = asked
         snapshot = self._snapshot_for(as_of)
         if snapshot is None:
             return Answer(text="I don't know.", confident=False)
@@ -418,39 +556,44 @@ class SnapshotKnowledge:
             if len(exact_links) == 1:
                 section = exact_links[0]
                 return _quote_answer(question, [(section, section.text)])
+        rarity = self._rarity(question, snapshot)
+        rates = self._rates_by_snapshot[snapshot.snapshot_id]
+        product_words = frozenset(rates.unknown_words(question)) if is_rate_lookup(question) else frozenset()
         if COMPARISON.search(question):
-            return _comparison_answer(question, ranked)
+            return _comparison_answer(question, ranked, rarity)
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
         if not api_key:
-            return _ranked_fallback(question, ranked)
-        sections = {section.section_id: section for section in ranked}
-        candidates = [
-            {
-                "id": section.section_id,
+            return _ranked_fallback(question, ranked, rarity, product_words)
+        # Luna answers with passage IDs, not copied text, so its reply is a few tokens long.
+        passages: dict[str, tuple[Section, int, str]] = {}
+        candidates = []
+        for number, section in enumerate(ranked, start=1):
+            pieces = []
+            for index, text in enumerate(_numbered_passages(section), start=1):
+                passages[f"{number}.{index}"] = (section, index, text)
+                pieces.append({"id": f"{number}.{index}", "text": text})
+            candidates.append({
                 "page_title": section.page_title,
                 "heading": " > ".join(section.heading_path),
                 "url": section.url,
-                "markdown": section.text[:MAX_SECTION_CHARS],
-            }
-            for section in ranked
-        ]
-        matches = select_evidence(question, candidates, api_key)
-        if matches is None:
-            return _ranked_fallback(question, ranked)
+                "passages": pieces,
+            })
+        chosen = select_passages(question, candidates, api_key)
+        if chosen is None:
+            return _ranked_fallback(question, ranked, rarity, product_words)
 
+        # Passages chosen from one section form one quote, in page order, so a schedule split
+        # across paragraphs stays whole.
+        picked: dict[str, tuple[Section, dict[int, str]]] = {}
+        for passage_id in chosen:
+            if isinstance(passage_id, str) and passage_id in passages:
+                section, index, text = passages[passage_id]
+                picked.setdefault(section.section_id, (section, {}))[1][index] = text
         place = _named_place(question)
         needs_schedule = place is not None and HOURS_QUESTION.search(question)
         evidence = []
-        for match in matches:
-            if not isinstance(match, dict):
-                continue
-            section_id, quote = match.get("section_id"), match.get("quote")
-            if not isinstance(section_id, str) or not isinstance(quote, str):
-                continue
-            section = sections.get(section_id)
-            quote = quote.strip()
-            if not section or not quote or quote not in section.text[:MAX_SECTION_CHARS]:
-                continue
+        for section, texts in picked.values():
+            quote = "\n\n".join(text for _, text in sorted(texts.items()))
             if not _mentions(section, place, quote if needs_schedule else section.text[:MAX_SECTION_CHARS]):
                 continue
             if needs_schedule and not _supports_hours(question, quote):

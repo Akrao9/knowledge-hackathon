@@ -82,6 +82,11 @@ LOWEST = re.compile(r"\b(?:lowest|cheapest|min(?:imum)?|least)\b", re.IGNORECASE
 NOT_LISTED = "Dupaco's published rate tables don't list a rate for that. Please contact Dupaco for details."
 
 
+def is_rate_lookup(question: str) -> bool:
+    """True for a question asking for a published rate, which the rate tables answer or decline."""
+    return bool(RATE_QUESTION.search(question)) and not NOT_A_RATE_LOOKUP.search(question)
+
+
 def _tokens(text: str) -> list[str]:
     words = []
     for word in WORD.findall(text.lower().replace("’", "'")):
@@ -341,7 +346,7 @@ class RateIndex:
         )
 
     def answer(self, question: str) -> Optional[Answer]:
-        if not RATE_QUESTION.search(question) or NOT_A_RATE_LOOKUP.search(question):
+        if not is_rate_lookup(question):
             return None
         question = DATE_SPAN.sub(" ", question)
         # "non-jumbo" or "without jumbo" excludes a variant rather than asking for it.
@@ -357,10 +362,14 @@ class RateIndex:
         bar = 0.4 * sum(self.idf[word] for word in known - VARIANTS)
         scored = []
         for trust in (3, 2):
-            scored = [
-                (sum(self.idf[word] for word in known & row.tokens), row) for row in self.rows
-                if row.trust == trust and (not products or products & row.tokens)
-            ]
+            tier = [row for row in self.rows if row.trust == trust]
+            if products:
+                # A row's own caption or label must name the product; the page's headings count only when
+                # no row does, so certificate rows on the savings page don't answer a savings question.
+                tier = [row for row in tier if products & (row.product | row.shape)] or [
+                    row for row in tier if products & row.tokens
+                ]
+            scored = [(sum(self.idf[word] for word in known & row.tokens), row) for row in tier]
             if scored and max(score for score, _ in scored) >= bar:
                 break
         else:
@@ -406,8 +415,16 @@ class RateIndex:
 
         best = max(score for score, _ in pool)
         rows = [row for score, row in pool if score >= best - 1e-9]
-        if (words & VARIANTS) - set().union(*(row.tokens for row in rows)):
+        carried = set().union(*(row.tokens for row in rows))
+        if (words & VARIANTS) - carried:
             return Answer(text=NOT_LISTED, confident=False)
+        # A word the rows don't carry ("kids savings", "signature loan", "personal line of credit") may name
+        # a product the tables call something else. If the rows span several products, or are all a variant
+        # the question didn't ask for, guessing would quote another product's rate, so search answers instead.
+        if words - GENERIC - carried and not LIST_INTENT.search(question):
+            several = len({row.product for row in rows}) > 1
+            if several or all(row.variants - words for row in rows):
+                return None
 
         metric = self._metric(question)
 
@@ -439,6 +456,11 @@ class RateIndex:
         text = lines[0] + "." if len(lines) == 1 else "Published rates:\n" + "\n".join(f"- {line}" for line in lines)
         note = "Pages disagree on this rate; the answer uses the most authoritative, most recently effective table." if overruled else None
         return Answer(text=text, sources=sources[:6], conflict_note=note)
+
+    def unknown_words(self, question: str) -> set[str]:
+        """Question words no rate table uses, such as "kids" in "kids savings account"."""
+        words = set(_tokens(DATE_SPAN.sub(" ", question))) - GENERIC - VARIANTS
+        return {word for word in words if word not in self.idf}
 
     @staticmethod
     def _metric(question: str) -> Optional[str]:
