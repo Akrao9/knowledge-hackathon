@@ -19,7 +19,7 @@ export OPENAI_API_KEY=your-key
 python harness/run_eval.py --submission submission --eval eval/public_eval.jsonl
 ```
 
-Luna only chooses passages for free-text search questions: it replies with passage numbers, and the answer quotes those passages from the snapshot. Rate and comparison questions never call it. On the 40 practice questions, the score was 0.923 without a key and 0.962 with Luna (accuracy, consistency and speed; the practice run doesn't score contradictions). See [`submission/NOTES.md`](submission/NOTES.md) for details.
+Luna only chooses passages for free-text search questions: it replies with passage numbers, and the answer quotes those passages from the snapshot. Rate and comparison questions never call it. On the 40 practice questions, the score was 0.939 without a key and 0.962 with Luna (accuracy, consistency and speed; the practice run doesn't score contradictions). See [`submission/NOTES.md`](submission/NOTES.md) for details.
 
 ## The problem in one minute
 

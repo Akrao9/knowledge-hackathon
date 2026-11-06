@@ -63,6 +63,7 @@ TABLE_RULE = re.compile(r"^[\s|:-]*-{3}[\s|:-]*$")
 BLANK_LINES = re.compile(r"\n\s*\n(?:\s*\n)+")
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]\n]*\]\([^)\s]*\)")
 TEASER_HEADINGS = frozenset({"Handpicked for You"})
+FAQ_QUESTION = re.compile(r"(?:[-*+]\s+)?\**\[?([^\[\]\n]{5,200}?\?)\]?(?:\([^)\s]*\))?\**")
 LINKED_ITEM = re.compile(r"^(?:[-*+]|\d+\\?\.)\s+\[")
 LINKED_HEADING = re.compile(r"^\**\[[^\]\n]+\]\((\S+?)(?:\s+\"[^\"]*\")?\)\**$")
 # Articles, press releases and calculators explain or announce; product pages state current terms.
@@ -367,13 +368,18 @@ def _ranked_passages(
         else:
             passages = section.text.split("\n\n")
             heading_terms = set()
+        faq_terms: set[str] = set()
         for passage in passages:
             quote = passage.strip()[:MAX_FALLBACK_CHARS]
-            if not quote or not _has_prose(quote) or not _mentions(section, place, quote):
+            # An FAQ question line ("- [Can I use both cards in my mobile wallet?](#)") names the topic
+            # of the answer paragraph below it, the way a heading does.
+            faq = FAQ_QUESTION.fullmatch(quote)
+            context, faq_terms = heading_terms | faq_terms, _rank_terms(faq[1]) if faq else set()
+            if faq or not quote or not _has_prose(quote) or not _mentions(section, place, quote):
                 continue
             if needs_schedule and not _supports_hours(question, quote):
                 continue
-            shared = terms & (_rank_terms(quote) | heading_terms)
+            shared = terms & (_rank_terms(quote) | context)
             if len(shared) >= 2 and len(shared) >= 0.4 * len(terms):
                 yield sum(rarity.get(term, 0) for term in shared), section, quote
 
@@ -530,10 +536,8 @@ class SnapshotKnowledge:
 
     def _answer(self, question: str, as_of: Optional[str]) -> Answer:
         if as_of is None:
-            # A date before the first snapshot can't be answered "as of", so the question gets the newest snapshot.
-            asked = _question_date(question)
-            if asked and self._snapshot_for(asked):
-                as_of = asked
+            # A date in the question works like as_of, so a date before the first snapshot gets "I don't know".
+            as_of = _question_date(question)
         snapshot = self._snapshot_for(as_of)
         if snapshot is None:
             return Answer(text="I don't know.", confident=False)

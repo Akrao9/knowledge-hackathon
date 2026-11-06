@@ -31,6 +31,13 @@ BRANCH_COUNT_QUESTION = re.compile(
     r"\b(?:branches|branch offices|branch(?: office)? locations|locations|offices)\b",
     re.IGNORECASE,
 )
+# A count of some branches ("in Dubuque", "open on Saturday", "with a drive-up window") isn't the total.
+BRANCH_SUBSET = re.compile(
+    r"\b(?:in|near|around)\s+(?!total\b)\w|\b(?:planned|proposed|shared|atms?|closed?|closing|hours?|late|early"
+    r"|(?:mon|tues|wednes|thurs|fri|satur|sun)days?|weekends?|holidays?|drive[- ]?(?:up|thru|through)"
+    r"|lobby|lobbies|tellers?|(?:have|has|with) an?|without|offers?)\b",
+    re.IGNORECASE,
+)
 MEMBERSHIP_QUESTION = re.compile(
     r"\b(?:eligible|eligibility|qualify|who (?:can|may|is allowed to)|allowed to|requirements?)\b.*\b(?:join|member(?:ship)?)\b"
     r"|\bmembership\b.*\b(?:eligible|eligibility|qualify|requirements?)\b", re.IGNORECASE,
@@ -182,9 +189,7 @@ class SnapshotFacts:
                             ))
 
     def answer(self, question: str) -> Optional[Answer]:
-        if BRANCH_COUNT_QUESTION.search(question) and not re.search(
-            r"\b(?:in|near|around)\s+(?!total\b)\w|\b(?:planned|proposed|shared|atms?)\b", question, re.I,
-        ):
+        if BRANCH_COUNT_QUESTION.search(question) and not BRANCH_SUBSET.search(question):
             counts = self._latest_branch_counts()
             if len(counts) > 1:
                 return Answer(
