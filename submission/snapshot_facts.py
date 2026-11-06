@@ -31,6 +31,7 @@ BRANCH_COUNT_QUESTION = re.compile(
     r"\b(?:branches|branch offices|branch(?: office)? locations|locations|offices)\b",
     re.IGNORECASE,
 )
+UNPUBLISHED_COUNT = "I don't know. Dupaco's website doesn't publish a count of those locations."
 # A count of some branches ("in Dubuque", "open on Saturday", "with a drive-up window") isn't the total.
 BRANCH_SUBSET = re.compile(
     r"\b(?:in|near|around)\s+(?!total\b)\w|\b(?:planned|proposed|shared|atms?|closed?|closing|hours?|late|early"
@@ -189,7 +190,11 @@ class SnapshotFacts:
                             ))
 
     def answer(self, question: str) -> Optional[Answer]:
-        if BRANCH_COUNT_QUESTION.search(question) and not BRANCH_SUBSET.search(question):
+        if BRANCH_COUNT_QUESTION.search(question) and BRANCH_SUBSET.search(question):
+            # The site states only the total. Its branch locator lists the branches near one city, so it can't
+            # count those open on Saturday, with a drive-up, or in a given city.
+            return Answer(text=UNPUBLISHED_COUNT, confident=False)
+        if BRANCH_COUNT_QUESTION.search(question):
             counts = self._latest_branch_counts()
             if len(counts) > 1:
                 return Answer(
