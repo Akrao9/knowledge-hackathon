@@ -1,0 +1,2 @@
+# No third-party packages: the submission uses only the Python standard library (3.9+).
+# The optional OpenAI call in luna.py uses urllib, so it needs no extra package either.

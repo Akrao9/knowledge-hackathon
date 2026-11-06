@@ -1,0 +1,2 @@
+# No third-party packages: submission/ uses only the Python standard library (3.9+).
+# See submission/requirements.txt and submission/NOTES.md.

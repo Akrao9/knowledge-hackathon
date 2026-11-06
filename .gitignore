@@ -1,0 +1,13 @@
+results/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.env.*
+snapshots/0*/
+
+# The website snapshots are shared for this event only and must not be published.
+snapshots_zip/
+*.zip
+# The organizers' assignment brief.
+Knowledge-Hackathon-Assignment.pdf
