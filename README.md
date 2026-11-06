@@ -10,7 +10,16 @@ The website snapshots are not in this repository; they were shared for the event
 python harness/run_eval.py --submission submission --eval eval/public_eval.jsonl
 ```
 
-The first run unpacks the zips into `snapshots/`. No packages or API keys are needed. Setting `OPENAI_API_KEY` is optional and only affects free-text search answers (see `NOTES.md`).
+The first run unpacks the zips into `snapshots/`. No packages or API keys are needed.
+
+**Optional: run with GPT-6 Luna.** Set an OpenAI API key before running the same command:
+
+```bash
+export OPENAI_API_KEY=your-key
+python harness/run_eval.py --submission submission --eval eval/public_eval.jsonl
+```
+
+Luna only picks quotes for free-text search questions, and the code checks each quote against the snapshot. Rate and comparison questions never call it. On the 40 practice questions, the score was 0.923 without a key and 0.937 with Luna (accuracy, consistency and speed; the practice run doesn't score contradictions). See [`submission/NOTES.md`](submission/NOTES.md) for details.
 
 ## The problem in one minute
 
