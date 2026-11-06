@@ -51,6 +51,13 @@ WORD_FORMS = {
 HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*)|$)")
 CLOSING_HASHES = re.compile(r"(?:^|[ \t]+)#+[ \t]*$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)")
+PHONE = re.compile(r"(?<!\d)(?:1[-.\s])?\(?\d{3}\)?[-.\s]\d{3}[-.]\d{4}(?!\d)")
+# "Phone number" or "call", not the phone itself ("phone wallets", "pay with my phone").
+PHONE_QUESTION = re.compile(r"\bphone (?:number|line)s?\b|\b(?:telephone|toll[- ]free|call)\b", re.IGNORECASE)
+NOT_A_PHONE_QUESTION = re.compile(r"\b(?:routing|aba|account number|card number)\b", re.IGNORECASE)
+# A search term no word can produce: sections with a phone number carry it, and questions asking for one
+# search only those sections.
+PHONE_TERM = "<phone>"
 HOURS_LABEL = re.compile(r"^\*\*(Lobby|Drive[- ]up)\*\*[ \t]*", re.IGNORECASE | re.MULTILINE)
 HOURS_DAY = re.compile(
     r"^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b[^:\n]{0,24}:\s+\S",
@@ -111,6 +118,33 @@ class Section:
     heading_path: tuple[str, ...]
     text: str
     link_target: Optional[str] = None
+
+
+def _singular(word: str) -> str:
+    return word[:-1] if len(word) > 3 and word.endswith("s") and not word.endswith("ss") else word
+
+
+def _wants_phone(question: str) -> bool:
+    return bool(PHONE_QUESTION.search(question)) and not NOT_A_PHONE_QUESTION.search(question)
+
+
+def _question_terms(question: str, *, phrases: bool = False) -> dict[str, float]:
+    """A question's search terms and their weights.
+
+    A plural word also searches its singular at half weight, so "students" finds "Student Loans" while
+    pages keep their own words. A question asking for a number to call also searches for phone numbers.
+    """
+    terms = dict.fromkeys(_rank_terms(question, phrases=phrases), 1.0)
+    for term in list(terms):
+        if " " not in term:
+            terms.setdefault(_singular(term), 0.5)
+    if _wants_phone(question):
+        terms[PHONE_TERM] = 1.0
+    return terms
+
+
+def _passage_terms(text: str) -> set[str]:
+    return _rank_terms(text) | ({PHONE_TERM} if PHONE.search(text) else set())
 
 
 def _rank_terms(text: str, *, phrases: bool = False) -> set[str]:
@@ -359,6 +393,10 @@ def _ranked_passages(
     Each passage is scored by the rarity of the question words it shares.
     """
     terms = _rank_terms(question)
+    forms = {term: {term, _singular(term)} for term in terms}
+    wants_phone = _wants_phone(question)
+    if wants_phone:
+        forms[PHONE_TERM] = {PHONE_TERM}
     place = _named_place(question)
     needs_schedule = place is not None and HOURS_QUESTION.search(question)
     for section in sections:
@@ -379,9 +417,12 @@ def _ranked_passages(
                 continue
             if needs_schedule and not _supports_hours(question, quote):
                 continue
-            shared = terms & (_rank_terms(quote) | context)
-            if len(shared) >= 2 and len(shared) >= 0.4 * len(terms):
-                yield sum(rarity.get(term, 0) for term in shared), section, quote
+            if wants_phone and not PHONE.search(quote):
+                continue
+            found = _passage_terms(quote) | context
+            matched = [form & found for form in forms.values() if form & found]
+            if len(matched) >= 2 and len(matched) >= 0.4 * len(forms):
+                yield sum(max(rarity.get(term, 0) for term in hit) for hit in matched), section, quote
 
 
 def _ranked_fallback(
@@ -464,7 +505,7 @@ class SnapshotKnowledge:
                 sections[section_id] = section
                 links.extend(_navigation_sections(section))
                 heading_terms = _rank_terms(" ".join(headings)) | _rank_terms(label, phrases=True)
-                for weight, terms in ((3, heading_terms), (2, page_terms), (1, _rank_terms(text))):
+                for weight, terms in ((3, heading_terms), (2, page_terms), (1, _passage_terms(text))):
                     for term in terms:
                         matches = postings.setdefault(term, {})
                         matches[section_id] = matches.get(section_id, 0) + weight * scale
@@ -491,10 +532,10 @@ class SnapshotKnowledge:
         count = len(self._sections_by_snapshot[snapshot.snapshot_id])
         postings = self._postings_by_snapshot[snapshot.snapshot_id]
         rarity = {}
-        for term in _rank_terms(question, phrases=phrases):
+        for term, weight in _question_terms(question, phrases=phrases).items():
             matches = postings.get(term)
             if matches:
-                rarity[term] = log1p((count - len(matches) + 0.5) / (len(matches) + 0.5))
+                rarity[term] = weight * log1p((count - len(matches) + 0.5) / (len(matches) + 0.5))
                 if MODEL_YEAR.fullmatch(term):
                     # The matching table row may express the requested year as a range.
                     rarity[term] *= 0.25
@@ -509,9 +550,12 @@ class SnapshotKnowledge:
         sections = self._sections_by_snapshot[snapshot.snapshot_id]
         postings = self._postings_by_snapshot[snapshot.snapshot_id]
         scores: dict[str, float] = {}
+        # A question asking for a number to call is answered only by a section that has one.
+        allowed = postings.get(PHONE_TERM, {}) if _wants_phone(question) else None
         for term, rarity in sorted(self._rarity(question, snapshot, phrases=True).items()):
             for section_id, weight in postings[term].items():
-                scores[section_id] = scores.get(section_id, 0) + rarity * weight
+                if allowed is None or section_id in allowed:
+                    scores[section_id] = scores.get(section_id, 0) + rarity * weight
 
         links = _rank_links(question, self._links_by_snapshot[snapshot.snapshot_id]) if LINK_QUESTION.search(question) else []
         ranked = links[:limit]
