@@ -55,8 +55,8 @@ WORD_FORMS = {
     "years": "year",
 }
 PHONE = re.compile(r"(?<!\d)(?:1[-.\s])?\(?\d{3}\)?[-.\s]\d{3}[-.]\d{4}(?!\d)")
-# "Phone number" or "call", not the phone itself ("phone wallets", "pay with my phone").
-PHONE_QUESTION = re.compile(r"\bphone (?:number|line)s?\b|\b(?:telephone|toll[- ]free|call)\b", re.IGNORECASE)
+# "Phone number", "call" or "extension", not the phone itself ("phone wallets", "pay with my phone").
+PHONE_QUESTION = re.compile(r"\bphone (?:number|line)s?\b|\b(?:telephone|toll[- ]free|call|extensions?)\b", re.IGNORECASE)
 NOT_A_PHONE_QUESTION = re.compile(r"\b(?:routing|aba|account number|card number)\b", re.IGNORECASE)
 # A search term no word can produce: sections with a phone number carry it, and questions asking for one
 # search only those sections.
@@ -85,6 +85,9 @@ LINKED_HEADING = re.compile(r"^\**\[[^\]\n]+\]\((\S+?)(?:\s+\"[^\"]*\")?\)\**$")
 ARTICLE_PATHS = ("/learn/", "/newsroom/", "/business/resources/", "/business-resources/", "/calculators/", "/hubfs/")
 DATED_PATH = re.compile(r"^/(?:19|20)\d{2}/")
 ARTICLE_WEIGHT = 0.6
+# A question that doesn't say "business" is about the personal product, as in the rate tables, so business
+# pages rank lower and answer only when no personal page does.
+BUSINESS_WEIGHT = 0.6
 MARKDOWN_LINK = re.compile(r"(?<!!)\[([^\]\n]+)\]\(([^)\s]+)\)")
 LINK_QUESTION = re.compile(r"\b(?:link|url)\b", re.IGNORECASE)
 LINK_WORDS = frozenset("dupaco link look see show should use url view web website".split())
@@ -112,8 +115,11 @@ AS_OF_DATE = re.compile(
 )
 # A member's own balance or an individual loan decision, which no public page can answer.
 PERSONAL_QUESTION = re.compile(
-    r"\b(?:current|exact)\s+balance\b[^?]*\bmy\b|\bhow much (?:money )?(?:is|do i have) in my\b"
-    r"|\bwould i\b[^?]*\b(?:be approved|qualify)\b|\b(?:approved|qualify)\b[^?]*\bcredit score\b",
+    # Asking for the balance itself ("What is the current balance in my checking account?"), not how to check it.
+    r"\bwhat(?:'s| is)\s+(?:the\s+)?(?:current\s+|exact\s+)?balance\s+(?:in|of|on)\s+my\b"
+    r"|\bhow much (?:money )?(?:is|do i have) in my\b"
+    # A decision for one applicant's own score ("approved ... with a 612 credit score"), not a published requirement.
+    r"|\b(?:approved|qualify)\b[^?]*\b\d{3}\s+credit score\b|\b\d{3}\s+credit score\b[^?]*\b(?:approved|qualify)\b",
     re.IGNORECASE,
 )
 PERSONAL_ANSWER = "I don't know. Dupaco's public website doesn't show personal account details or individual loan decisions."
@@ -201,6 +207,10 @@ def _has_prose(passage: str) -> bool:
         return False
     stripped = MARKDOWN_LINK.sub("", MARKDOWN_IMAGE.sub("", passage))
     return len(RANK_WORD.findall(stripped.lower())) >= 4
+
+
+def _is_business(url: str) -> bool:
+    return urlsplit(url).path.startswith(("/business/", "/business-"))
 
 
 def _is_article(url: str) -> bool:
@@ -586,6 +596,11 @@ class SnapshotKnowledge:
             for section_id, weight in postings[term].items():
                 if allowed is None or section_id in allowed:
                     scores[section_id] = scores.get(section_id, 0) + rarity * weight
+
+        if "business" not in _rank_terms(question):
+            for section_id in scores:
+                if _is_business(sections[section_id].url):
+                    scores[section_id] *= BUSINESS_WEIGHT
 
         links = _rank_links(question, self._links_by_snapshot[snapshot.snapshot_id]) if LINK_QUESTION.search(question) else []
         ranked = links[:limit]
