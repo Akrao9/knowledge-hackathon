@@ -2,7 +2,7 @@
 
 ## This submission
 
-The solution is in [`submission/`](submission/): `solution.py` (with `build()`), `rate_tables.py`, `snapshot_facts.py`, `luna.py`, `NOTES.md` and `requirements.txt`. [`submission/NOTES.md`](submission/NOTES.md) explains how it works and how it decides what's current.
+The solution is in [`submission/`](submission/): `solution.py` (with `build()`), `rate_tables.py`, `snapshot_facts.py`, `markdown_blocks.py`, `luna.py`, `NOTES.md` and `requirements.txt`. [`submission/NOTES.md`](submission/NOTES.md) explains how it works and how it decides what's current.
 
 The website snapshots are not in this repository; they were shared for the event only. To run the scorer, copy the kit's `snapshots_zip/` folder (the five snapshot zips) into the repository root, then run from the root:
 
@@ -10,7 +10,7 @@ The website snapshots are not in this repository; they were shared for the event
 python harness/run_eval.py --submission submission --eval eval/public_eval.jsonl
 ```
 
-The first run unpacks the zips into `snapshots/`. No packages or API keys are needed.
+Install the one package first with `pip install -r requirements.txt` (`markdown-it-py`). The first run unpacks the zips into `snapshots/`. No API key is needed.
 
 **Optional: run with GPT-6 Luna.** Set an OpenAI API key before running the same command:
 

@@ -9,14 +9,13 @@ from math import log
 from typing import Optional
 from urllib.parse import urlsplit
 
+import markdown_blocks
 from contract import Answer, Conflict, Page, Snapshot, Source
 
 RATE_SHEETS = ("/rates", "/business-rates")
 LOW_TRUST = ("/calculators/", "/learn/", "/newsroom/", "/hubfs/", "/business-resources/")
 TRUST_NAMES = {3: "official rate table", 2: "landing page", 1: "calculator, article or PDF"}
 
-TABLE_SEPARATOR = re.compile(r"^\|\s*:?-{2,}")
-HEADING = re.compile(r"^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
 EFFECTIVE = re.compile(r"\bRates are effective as of (\d{1,2}/\d{1,2}/\d{4})", re.IGNORECASE)
 PERCENT = re.compile(r"\d+(?:\.\d+)?(?=\s*%)")
 FOOTNOTE = re.compile(r"(%|\bAPR|\bAPY)(?:\d+|\s\d)\b")
@@ -213,6 +212,7 @@ def read_rate_rows(page: Page, snapshot_id: str, taken_on: str) -> list[RateRow]
     """Read every table row with a percentage, labelled by the headings and captions above its table."""
     path = urlsplit(page.url).path.rstrip("/") or "/"
     lines = page.markdown.splitlines()
+    blocks = markdown_blocks.parse(page.markdown)
     headings: list[tuple[int, str]] = []
     captions: list[str] = []
     section = caption = ""
@@ -220,16 +220,16 @@ def read_rate_rows(page: Page, snapshot_id: str, taken_on: str) -> list[RateRow]
     index = 0
     while index < len(lines):
         line = lines[index].strip()
-        heading = HEADING.match(lines[index])
-        if heading:
-            level = len(heading[1])
+        if index in blocks.headings:
+            level, title = blocks.headings[index]
             while headings and headings[-1][0] >= level:
                 headings.pop()
-            headings.append((level, heading[2].strip("* ")))
+            headings.append((level, title.strip("* ")))
             captions, section, caption = [], "", ""
             index += 1
             continue
-        if not (line.startswith("|") and index + 1 < len(lines) and TABLE_SEPARATOR.match(lines[index + 1].strip())):
+        table = blocks.tables.get(index)
+        if table is None:
             label = _label_line(line) if line else None
             if label:
                 captions.append(label)
@@ -242,12 +242,7 @@ def read_rate_rows(page: Page, snapshot_id: str, taken_on: str) -> list[RateRow]
         elif captions:
             caption = captions[0]
         captions = []
-        header = [cell.strip() for cell in line.strip("|").split("|")]
-        body = []
-        index += 2
-        while index < len(lines) and lines[index].strip().startswith("|"):
-            body.append(lines[index].strip())
-            index += 1
+        index = table.end
         effective = ""
         for following in lines[index:index + 12]:
             if following.startswith(("|", "#")):
@@ -265,10 +260,10 @@ def read_rate_rows(page: Page, snapshot_id: str, taken_on: str) -> list[RateRow]
         # The page title is a fallback label; on the rate sheet it names every product at once.
         title = "" if section or caption else page.title.split("|")[0]
         context = " ".join([title, *(text for _, text in headings), section, caption])
-        for quote in body:
-            cells = [cell.strip() for cell in quote.strip("|").split("|")]
+        for line_number, cells in table.rows:
+            quote = lines[line_number].strip()
             values, labels = [], []
-            for name, cell in zip(header, cells):
+            for name, cell in zip(table.header, cells):
                 if re.match(r"min|points|.*payment", name.strip("\\* ").lower()):
                     continue
                 cleaned = FOOTNOTE.sub(r"\1", cell)

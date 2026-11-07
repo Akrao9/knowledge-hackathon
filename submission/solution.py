@@ -15,6 +15,7 @@ from urllib.parse import urljoin, urlsplit
 _HARNESS = next((d / "harness" for d in Path(__file__).resolve().parents if (d / "harness" / "contract.py").exists()), None)
 if _HARNESS is not None and str(_HARNESS) not in sys.path:
     sys.path.insert(0, str(_HARNESS))
+import markdown_blocks  # noqa: E402
 from contract import Answer, Conflict, Snapshot, Source  # noqa: E402
 from luna import select_passages  # noqa: E402
 from rate_tables import RateIndex, is_rate_lookup  # noqa: E402
@@ -48,9 +49,6 @@ WORD_FORMS = {
     "vehicles": "vehicle",
     "years": "year",
 }
-HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*)|$)")
-CLOSING_HASHES = re.compile(r"(?:^|[ \t]+)#+[ \t]*$")
-FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)")
 PHONE = re.compile(r"(?<!\d)(?:1[-.\s])?\(?\d{3}\)?[-.\s]\d{3}[-.]\d{4}(?!\d)")
 # "Phone number" or "call", not the phone itself ("phone wallets", "pay with my phone").
 PHONE_QUESTION = re.compile(r"\bphone (?:number|line)s?\b|\b(?:telephone|toll[- ]free|call)\b", re.IGNORECASE)
@@ -182,30 +180,10 @@ def _markdown_sections(markdown: str) -> Iterator[tuple[tuple[str, ...], str]]:
     lines = markdown.splitlines()
     headings: list[tuple[int, str]] = []
     start = 0
-    fence = ""
-    for index, line in enumerate(lines):
-        marker = FENCE.match(line)
-        if marker:
-            ticks, info = marker.groups()
-            if not fence:
-                fence = ticks
-            elif ticks.startswith(fence) and not info.strip():
-                fence = ""
-            continue
-        if fence:
-            continue
-
-        heading = HEADING.match(line)
-        if not heading:
-            continue
-
+    for index, (level, title) in sorted(markdown_blocks.parse(markdown).headings.items()):
         text = "\n".join(lines[start:index]).strip("\n")
         if text.strip():
             yield tuple(title for _, title in headings), text
-
-        hashes, raw_title = heading.groups()
-        level = len(hashes)
-        title = CLOSING_HASHES.sub("", raw_title or "").strip()
         while headings and headings[-1][0] >= level:
             headings.pop()
         if title:
