@@ -25,6 +25,11 @@ RANK_WORD = re.compile(r"[a-z0-9]+")
 MODEL_YEAR = re.compile(r"(?:19|20)[0-9]{2}")
 MAX_SECTION_CHARS = 5000
 MAX_FALLBACK_CHARS = 600
+# Search answers from the top 8 sections. Luna also sees the next 8, each by its two passages that share
+# the rarest question words, so a section just below the cut can still answer without doubling the prompt.
+SEARCH_SECTIONS = 8
+LUNA_SECTIONS = 16
+COMPACT_PASSAGES = 2
 STOP_WORDS = frozenset(
     "a an and are as at be can could did do does for from how i in is it me my of on or s "
     "tell that the their this to was were what when where which who will with would you your".split()
@@ -315,6 +320,14 @@ def _numbered_passages(section: Section) -> list[str]:
     return pieces
 
 
+def _best_pieces(pieces: list[str], rarity: dict[str, float], count: int) -> list[int]:
+    """Indexes of the pieces sharing the rarest question words, in page order; none if no piece shares any."""
+    scores = [(sum(weight for term, weight in rarity.items() if term in _passage_terms(text)), index)
+              for index, text in enumerate(pieces)]
+    best = sorted((item for item in scores if item[0] > 0), key=lambda item: (-item[0], item[1]))[:count]
+    return sorted(index for _, index in best)
+
+
 def _quote_answer(question: str, evidence: list[tuple[Section, str]]) -> Answer:
     limit = 3 if COMPARISON.search(question) else 1
     quotes = []
@@ -602,7 +615,8 @@ class SnapshotKnowledge:
         if resolved is not None:
             return resolved
 
-        ranked = self._rank_sections(question, as_of)
+        wide = self._rank_sections(question, as_of, limit=LUNA_SECTIONS)
+        ranked = wide[:SEARCH_SECTIONS]
         if not ranked:
             return Answer(text="I don't know.", confident=False)
         if ranked[0].link_target:
@@ -625,11 +639,15 @@ class SnapshotKnowledge:
         # Luna answers with passage IDs, not copied text, so its reply is a few tokens long.
         passages: dict[str, tuple[Section, int, str]] = {}
         candidates = []
-        for number, section in enumerate(ranked, start=1):
+        for number, section in enumerate(wide, start=1):
+            texts = _numbered_passages(section)
+            keep = range(len(texts)) if number <= SEARCH_SECTIONS else _best_pieces(texts, rarity, COMPACT_PASSAGES)
+            if not keep:
+                continue
             pieces = []
-            for index, text in enumerate(_numbered_passages(section), start=1):
-                passages[f"{number}.{index}"] = (section, index, text)
-                pieces.append({"id": f"{number}.{index}", "text": text})
+            for index in keep:
+                passages[f"{number}.{index + 1}"] = (section, index + 1, texts[index])
+                pieces.append({"id": f"{number}.{index + 1}", "text": texts[index]})
             candidates.append({
                 "page_title": section.page_title,
                 "heading": " > ".join(section.heading_path),
