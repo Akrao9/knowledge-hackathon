@@ -62,7 +62,12 @@ HOURS_DAY = re.compile(
     re.IGNORECASE,
 )
 HOURS_QUESTION = re.compile(r"\b(?:hours|what time)\b", re.IGNORECASE)
-HOURS_SERVICE = re.compile(r"\b(lobby|drive[- ]up)\b", re.IGNORECASE)
+# The service a schedule is for, by word stem, so "lobbies" and "drive-thru" match "Lobby" and "Drive-up" labels.
+HOURS_SERVICE = re.compile(r"\b(lobb|driv)(?:y|ies|e)\b", re.IGNORECASE)
+# "What time do lobbies open?", "When are lobbies open?", not "When can I open an account?" or "How many hours".
+SCHEDULE_QUESTION = re.compile(r"\b(?:hours|what time)\b|\bwhen (?:is|are)\b[^?]*\bopen\b", re.IGNORECASE)
+NOT_A_SCHEDULE_QUESTION = re.compile(r"\bhow (?:many|much|long)\b|\d\s*hours\b", re.IGNORECASE)
+SCHEDULE_TERM = "<schedule>"
 TABLE_LINE = re.compile(r"^\s*\|")
 TABLE_RULE = re.compile(r"^[\s|:-]*-{3}[\s|:-]*$")
 BLANK_LINES = re.compile(r"\n\s*\n(?:\s*\n)+")
@@ -119,11 +124,22 @@ class Section:
 
 
 def _singular(word: str) -> str:
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"  # "lobbies" -> "lobby", "policies" -> "policy"
     return word[:-1] if len(word) > 3 and word.endswith("s") and not word.endswith("ss") else word
 
 
 def _wants_phone(question: str) -> bool:
     return bool(PHONE_QUESTION.search(question)) and not NOT_A_PHONE_QUESTION.search(question)
+
+
+def _wants_schedule(question: str) -> bool:
+    return bool(SCHEDULE_QUESTION.search(question)) and not NOT_A_SCHEDULE_QUESTION.search(question)
+
+
+def _has_schedule(text: str) -> bool:
+    """At least two weekday lines ("Monday-Thursday: 8:30 a.m.-5 p.m."), so a section lists opening hours."""
+    return sum(bool(HOURS_DAY.match(line.lstrip())) for line in text.splitlines()) >= 2
 
 
 def _question_terms(question: str, *, phrases: bool = False) -> dict[str, float]:
@@ -138,11 +154,16 @@ def _question_terms(question: str, *, phrases: bool = False) -> dict[str, float]
             terms.setdefault(_singular(term), 0.5)
     if _wants_phone(question):
         terms[PHONE_TERM] = 1.0
+    if _wants_schedule(question):
+        terms[SCHEDULE_TERM] = 1.0
     return terms
 
 
 def _passage_terms(text: str) -> set[str]:
-    return _rank_terms(text) | ({PHONE_TERM} if PHONE.search(text) else set())
+    markers = {PHONE_TERM} if PHONE.search(text) else set()
+    if _has_schedule(text):
+        markers.add(SCHEDULE_TERM)
+    return _rank_terms(text) | markers
 
 
 def _rank_terms(text: str, *, phrases: bool = False) -> set[str]:
@@ -357,7 +378,7 @@ def _mentions(section: Section, place: Optional[frozenset[str]], passage: str) -
 def _supports_hours(question: str, passage: str) -> bool:
     service = HOURS_SERVICE.search(question)
     label = HOURS_LABEL.match(passage)
-    if service and (not label or service[1].lower().replace(" ", "-") != label[1].lower().replace(" ", "-")):
+    if service and (not label or not label[1].lower().startswith(service[1].lower())):
         return False
     schedule = passage[label.end():] if label else passage
     return any(HOURS_DAY.match(line.lstrip()) for line in schedule.splitlines())
@@ -375,8 +396,11 @@ def _ranked_passages(
     wants_phone = _wants_phone(question)
     if wants_phone:
         forms[PHONE_TERM] = {PHONE_TERM}
+    wants_schedule = _wants_schedule(question)
+    if wants_schedule:
+        forms[SCHEDULE_TERM] = {SCHEDULE_TERM}
     place = _named_place(question)
-    needs_schedule = place is not None and HOURS_QUESTION.search(question)
+    needs_schedule = (place is not None and HOURS_QUESTION.search(question)) or _wants_schedule(question)
     for section in sections:
         if len(section.text) <= MAX_FALLBACK_CHARS:
             passages = [section.text]
@@ -399,7 +423,10 @@ def _ranked_passages(
                 continue
             found = _passage_terms(quote) | context
             matched = [form & found for form in forms.values() if form & found]
-            if len(matched) >= 2 and len(matched) >= 0.4 * len(forms):
+            # A weekly schedule answers "open", "close" and "what time" itself, so it needs one more
+            # question word (the service or the place) instead of the usual share of them.
+            enough = SCHEDULE_TERM in found if wants_schedule else len(matched) >= 0.4 * len(forms)
+            if len(matched) >= 2 and enough:
                 yield sum(max(rarity.get(term, 0) for term in hit) for hit in matched), section, quote
 
 
@@ -528,8 +555,13 @@ class SnapshotKnowledge:
         sections = self._sections_by_snapshot[snapshot.snapshot_id]
         postings = self._postings_by_snapshot[snapshot.snapshot_id]
         scores: dict[str, float] = {}
-        # A question asking for a number to call is answered only by a section that has one.
-        allowed = postings.get(PHONE_TERM, {}) if _wants_phone(question) else None
+        # A question asking for a number to call is answered only by a section that has one, and a
+        # question asking when something is open only by a section with a weekly schedule.
+        allowed = None
+        for wanted, marker in ((_wants_phone(question), PHONE_TERM), (_wants_schedule(question), SCHEDULE_TERM)):
+            if wanted:
+                with_marker = set(postings.get(marker, {}))
+                allowed = with_marker if allowed is None else allowed & with_marker
         for term, rarity in sorted(self._rarity(question, snapshot, phrases=True).items()):
             for section_id, weight in postings[term].items():
                 if allowed is None or section_id in allowed:
@@ -616,7 +648,7 @@ class SnapshotKnowledge:
                 section, index, text = passages[passage_id]
                 picked.setdefault(section.section_id, (section, {}))[1][index] = text
         place = _named_place(question)
-        needs_schedule = place is not None and HOURS_QUESTION.search(question)
+        needs_schedule = (place is not None and HOURS_QUESTION.search(question)) or _wants_schedule(question)
         evidence = []
         for section, texts in picked.values():
             quote = "\n\n".join(text for _, text in sorted(texts.items()))
