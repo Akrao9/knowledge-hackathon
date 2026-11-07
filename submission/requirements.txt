@@ -1,3 +1,4 @@
-# Markdown parsing (headings and tables). Everything else is the Python standard library.
-# The optional OpenAI call in luna.py uses urllib, so it needs no extra package.
+# Markdown parsing (headings and tables) and the optional OpenAI call in luna.py.
+# Everything else is the Python standard library.
 markdown-it-py==3.0.0
+openai==3.35.1

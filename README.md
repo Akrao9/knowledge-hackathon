@@ -10,7 +10,7 @@ The website snapshots are not in this repository; they were shared for the event
 python harness/run_eval.py --submission submission --eval eval/public_eval.jsonl
 ```
 
-Install the one package first with `pip install -r requirements.txt` (`markdown-it-py`). The first run unpacks the zips into `snapshots/`. No API key is needed.
+Install the packages first with `pip install -r requirements.txt` (`markdown-it-py` and `openai`). The first run unpacks the zips into `snapshots/`. No API key is needed.
 
 **Optional: run with GPT-6 Luna.** Set an OpenAI API key before running the same command:
 

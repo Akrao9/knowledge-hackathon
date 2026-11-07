@@ -1,2 +1,3 @@
 # Same as submission/requirements.txt; see submission/NOTES.md.
 markdown-it-py==3.0.0
+openai==3.35.1
