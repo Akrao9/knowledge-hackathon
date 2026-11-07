@@ -75,6 +75,8 @@ NOT_A_RATE_LOOKUP = re.compile(
     r"\b(?:links?|urls?|calculat\w*|why|explain\w*|history|historical|penalt\w*|fees?|how (?:do|does|can|is|are))\b",
     re.IGNORECASE,
 )
+# Words that ask for the rate itself, unlike "earn dividends", "High-Yield Savings" or "principal and interest".
+RATE_FIGURE = re.compile(r"\b(?:rates?|aprs?|apys?|percent(?:age)?)\b|%", re.IGNORECASE)
 LIST_INTENT = re.compile(r"\b(?:all|every|list|offer\w*|options|available|types|kinds)\b|\bwhat\b.*\bdo you have\b", re.I)
 HIGHEST = re.compile(r"\b(?:highest|best|top|max(?:imum)?|most)\b", re.IGNORECASE)
 LOWEST = re.compile(r"\b(?:lowest|cheapest|min(?:imum)?|least)\b", re.IGNORECASE)
@@ -340,8 +342,16 @@ class RateIndex:
             peer is left for peer in self._closest(right, left.path)
         )
 
-    def answer(self, question: str) -> Optional[Answer]:
+    def asks_for_rate(self, question: str) -> bool:
+        """A rate question for the tables. One with two or more words no rate table uses ("statement
+        enrollment required", "points per dollar spent") that doesn't ask for a rate figure is about
+        something else that rate vocabulary only touches, so search answers it."""
         if not is_rate_lookup(question):
+            return False
+        return len(self.unknown_words(question)) < 2 or bool(RATE_FIGURE.search(question))
+
+    def answer(self, question: str) -> Optional[Answer]:
+        if not self.asks_for_rate(question):
             return None
         question = DATE_SPAN.sub(" ", question)
         # "non-jumbo" or "without jumbo" excludes a variant rather than asking for it.

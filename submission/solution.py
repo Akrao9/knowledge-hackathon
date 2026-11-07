@@ -18,7 +18,7 @@ if _HARNESS is not None and str(_HARNESS) not in sys.path:
 import markdown_blocks  # noqa: E402
 from contract import Answer, Conflict, Snapshot, Source  # noqa: E402
 from luna import select_passages  # noqa: E402
-from rate_tables import RateIndex, is_rate_lookup  # noqa: E402
+from rate_tables import RateIndex  # noqa: E402
 from snapshot_facts import SnapshotFacts  # noqa: E402
 
 RANK_WORD = re.compile(r"[a-z0-9]+")
@@ -110,6 +110,13 @@ AS_OF_DATE = re.compile(
     r"|(?P<iso>(?:19|20)\d{2}-\d{2}-\d{2})|(?P<us_month>\d{1,2})/(?P<us_day>\d{1,2})/(?P<us_year>(?:19|20)\d{2}))\b",
     re.IGNORECASE,
 )
+# A member's own balance or an individual loan decision, which no public page can answer.
+PERSONAL_QUESTION = re.compile(
+    r"\b(?:current|exact)\s+balance\b[^?]*\bmy\b|\bhow much (?:money )?(?:is|do i have) in my\b"
+    r"|\bwould i\b[^?]*\b(?:be approved|qualify)\b|\b(?:approved|qualify)\b[^?]*\bcredit score\b",
+    re.IGNORECASE,
+)
+PERSONAL_ANSWER = "I don't know. Dupaco's public website doesn't show personal account details or individual loan decisions."
 COMPARISON = re.compile(
     r"\bcompare\b|\b(?:all|every|each)\b.{0,100}\b(?:same|identical)\b|\b(?:same|identical)\b.{0,60}\b(?:all|every|each)\b"
     r"|\b(?:differ|vary)\b.{0,60}\b(?:by|between|across|from)\b",
@@ -444,14 +451,14 @@ def _ranked_passages(
 
 
 def _ranked_fallback(
-    question: str, sections: list[Section], rarity: dict[str, float], product_words: frozenset[str] = frozenset()
+    question: str, sections: list[Section], rarity: dict[str, float], product_words: frozenset[str] = frozenset(),
+    skip_rate_rows: bool = False,
 ) -> Answer:
     """The best passage, or "I don't know".
 
     A rate question reaches search only after the rate index read every table and found no single product,
     so a table is not quoted again, and the passage must name the words no table used ("signature loan").
     """
-    skip_rate_rows = is_rate_lookup(question)
     best = None
     best_score = 0.0
     for score, section, quote in _ranked_passages(question, sections, rarity):
@@ -608,6 +615,8 @@ class SnapshotKnowledge:
         snapshot = self._snapshot_for(as_of)
         if snapshot is None:
             return Answer(text="I don't know.", confident=False)
+        if PERSONAL_QUESTION.search(question):
+            return Answer(text=PERSONAL_ANSWER, confident=False)
 
         resolved = self._facts_by_snapshot[snapshot.snapshot_id].answer(question)
         if resolved is None:
@@ -630,12 +639,13 @@ class SnapshotKnowledge:
                 return _quote_answer(question, [(section, section.text)])
         rarity = self._rarity(question, snapshot)
         rates = self._rates_by_snapshot[snapshot.snapshot_id]
-        product_words = frozenset(rates.unknown_words(question)) if is_rate_lookup(question) else frozenset()
+        rate_lookup = rates.asks_for_rate(question)
+        product_words = frozenset(rates.unknown_words(question)) if rate_lookup else frozenset()
         if COMPARISON.search(question):
             return _comparison_answer(question, ranked, rarity)
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
         if not api_key:
-            return _ranked_fallback(question, ranked, rarity, product_words)
+            return _ranked_fallback(question, ranked, rarity, product_words, rate_lookup)
         # Luna answers with passage IDs, not copied text, so its reply is a few tokens long.
         passages: dict[str, tuple[Section, int, str]] = {}
         candidates = []
@@ -656,7 +666,7 @@ class SnapshotKnowledge:
             })
         chosen = select_passages(question, candidates, api_key)
         if chosen is None:
-            return _ranked_fallback(question, ranked, rarity, product_words)
+            return _ranked_fallback(question, ranked, rarity, product_words, rate_lookup)
 
         # Passages chosen from one section form one quote, in page order, so a schedule split
         # across paragraphs stays whole.
