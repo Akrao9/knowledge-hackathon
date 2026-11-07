@@ -55,8 +55,14 @@ WORD_FORMS = {
     "years": "year",
 }
 PHONE = re.compile(r"(?<!\d)(?:1[-.\s])?\(?\d{3}\)?[-.\s]\d{3}[-.]\d{4}(?!\d)")
-# "Phone number", "call" or "extension", not the phone itself ("phone wallets", "pay with my phone").
-PHONE_QUESTION = re.compile(r"\bphone (?:number|line)s?\b|\b(?:telephone|toll[- ]free|call|extensions?)\b", re.IGNORECASE)
+# "Phone number" or "call", not the phone itself ("phone wallets", "pay with my phone"). "Extension" counts only
+# beside a word for dialing or reaching someone, so browser or scholarship extensions keep ordinary search.
+PHONE_QUESTION = re.compile(
+    r"\bphone (?:number|line)s?\b|\b(?:telephone|toll[- ]free|call)\b"
+    r"|\bextensions?\b[^?]*\b(?:dial\w*|reach\w*|phone|contact\w*)\b"
+    r"|\b(?:dial\w*|reach\w*|phone|contact\w*)\b[^?]*\bextensions?\b",
+    re.IGNORECASE,
+)
 NOT_A_PHONE_QUESTION = re.compile(r"\b(?:routing|aba|account number|card number)\b", re.IGNORECASE)
 # A search term no word can produce: sections with a phone number carry it, and questions asking for one
 # search only those sections.
@@ -118,7 +124,11 @@ PERSONAL_QUESTION = re.compile(
     # Asking for the balance itself ("What is the current balance in my checking account?"), not how to check it.
     r"\bwhat(?:'s| is)\s+(?:the\s+)?(?:current\s+|exact\s+)?balance\s+(?:in|of|on)\s+my\b"
     r"|\bhow much (?:money )?(?:is|do i have) in my\b"
-    # A decision for one applicant's own score ("approved ... with a 612 credit score"), not a published requirement.
+    # A decision about this member ("What APR would I be approved for?", "Will I qualify?"), not a published
+    # requirement ("What credit score would I need to qualify?", "What do I need to be approved?").
+    r"|\b(?:would|will)\s+i\s+(?:personally\s+)?(?:be|get)\s+approved\b|\b(?:would|will)\s+i\s+(?:personally\s+)?qualify\b"
+    r"|\bam\s+i\s+(?:pre-?)?(?:approved|qualified)\b"
+    # An approval for one applicant's stated score ("approved ... with a 612 credit score").
     r"|\b(?:approved|qualify)\b[^?]*\b\d{3}\s+credit score\b|\b\d{3}\s+credit score\b[^?]*\b(?:approved|qualify)\b",
     re.IGNORECASE,
 )
