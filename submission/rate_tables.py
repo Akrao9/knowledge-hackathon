@@ -2,7 +2,7 @@
 
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from math import log
@@ -60,6 +60,8 @@ SYNONYMS = {
     "refinancing": "refinance", "refinanced": "refinance", "intro": "introductory", "hsa": "health",
     "iras": "ira", "arm": "arm home loan", "arms": "arm home loan", "fha": "fha home loan", "usda": "usda home loan",
     "mo": "month", "mos": "month", "yr": "year", "yrs": "year",
+    # Tables name the default, non-promotional rate "Regular" (certificates) or "Standard" (HELOC, Visa).
+    "standard": "regular",
 }
 # Nouns that name a product family; a matching row must carry one the question uses.
 PRODUCT_NOUNS = frozenset("certificate loan card saving checking market ira heloc".split())
@@ -157,6 +159,25 @@ def _model_years(text: str) -> Optional[tuple[Optional[int], int]]:
     return (None if and_older else first_year), last_year
 
 
+# A promotional offer's table splits a figure by period: "Dividend Rate for 1st 6 Months" and "APY After
+# Promotional Period".
+AFTER_PERIOD = re.compile(r"\bafter\b", re.IGNORECASE)
+INTRO_PERIOD = re.compile(r"\b(?:1st|first|intro\w*)\b", re.IGNORECASE)
+# A question about the period after a promotion ("once the introductory period ends", "after six months").
+ASKS_AFTER = re.compile(r"\b(?:after|once|ends?|ended|expires?|post-promotion\w*)\b", re.IGNORECASE)
+
+
+PERIOD_PHRASE = re.compile(r"\b(?:for|after)\b.*", re.IGNORECASE)
+
+
+def _period(header: str) -> str:
+    if AFTER_PERIOD.search(header):
+        return "after"
+    if INTRO_PERIOD.search(header):
+        return "intro"
+    return ""
+
+
 def _value_kind(header: str, cell: str) -> str:
     # A unit printed in the cell beats the column header, which some pages copy from other tables.
     unit = re.search(r"\b(APR|APY)\b", cell, re.IGNORECASE)
@@ -227,6 +248,7 @@ def read_rate_rows(page: Page, snapshot_id: str, taken_on: str) -> list[RateRow]
     captions: list[str] = []
     section = caption = ""
     rows = []
+    previous: Optional[tuple[tuple[str, ...], frozenset]] = None  # the last table's columns and product nouns
     index = 0
     while index < len(lines):
         line = lines[index].strip()
@@ -270,6 +292,8 @@ def read_rate_rows(page: Page, snapshot_id: str, taken_on: str) -> list[RateRow]
         # The page title is a fallback label; on the rate sheet it names every product at once.
         title = "" if section or caption else page.title.split("|")[0]
         context = " ".join([title, *(text for _, text in headings), section, caption])
+        columns = tuple(" ".join(re.findall(r"[a-z]+", name.lower())) for name in table.header)
+        table_rows = []
         for line_number, cells in table.rows:
             quote = lines[line_number].strip()
             values, labels = [], []
@@ -279,7 +303,10 @@ def read_rate_rows(page: Page, snapshot_id: str, taken_on: str) -> list[RateRow]
                 cleaned = FOOTNOTE.sub(r"\1", cell)
                 number = PERCENT.search(cleaned)
                 if number:
-                    values.append((_value_kind(name, cleaned), cleaned, Decimal(number[0])))
+                    kind = _value_kind(name, cleaned)
+                    period = PERIOD_PHRASE.search(name) if _period(name) else None
+                    text = f"{cleaned} {kind} {period[0].strip('*').lower()}" if period else cleaned
+                    values.append((kind, text, Decimal(number[0])))
                 elif cell and cell != "—":
                     labels.append(cleaned)
             if not values or not labels:
@@ -288,16 +315,29 @@ def read_rate_rows(page: Page, snapshot_id: str, taken_on: str) -> list[RateRow]
             label_tokens = set(_tokens(label))
             show_caption = caption and not set(_tokens(caption)) <= label_tokens
             tokens = frozenset(_tokens(context) + list(label_tokens))
+            variants = tokens & VARIANTS
+            if any(_period(text) for _, text, _ in values):
+                # Figures for an introductory period make the row a promotional offer the question can name.
+                tokens |= {"introductory"}
             terms = _term_months(label)
             normalized = re.sub(r"\.00\b|,", "", label.lower().replace("–", "-"))
-            rows.append(RateRow(
+            table_rows.append(RateRow(
                 url=page.url, path=path, snapshot_id=snapshot_id, trust=_trust(path), effective=effective,
                 display=f"{caption} – {label}" if show_caption else label,
                 label_key=re.sub(r"[^a-z0-9$+]+", " ", normalized).strip(),
-                shape=frozenset(label_tokens), product=frozenset(_tokens(caption or title)) - GENERIC, tokens=tokens, variants=tokens & VARIANTS,
+                shape=frozenset(label_tokens), product=frozenset(_tokens(caption or title)) - GENERIC, tokens=tokens, variants=variants,
                 term=min(terms) if len(terms) == 1 else None, years=_model_years(label),
                 amount=_amount_range(label), values=tuple(values), quote=quote,
             ))
+        # A table that names no product family, such as the May rate sheet's "Regular" below its certificate
+        # specials, continues the family of the table before it when both have the same columns.
+        nouns = frozenset().union(*(row.tokens for row in table_rows)) & PRODUCT_NOUNS
+        if table_rows and not nouns and previous and previous[0] == columns:
+            nouns = previous[1]
+            table_rows = [replace(row, tokens=row.tokens | nouns, product=row.product | nouns) for row in table_rows]
+        if table_rows:
+            previous = (columns, nouns)
+        rows.extend(table_rows)
     return rows
 
 
@@ -373,7 +413,10 @@ class RateIndex:
         # Score rows by the rarity of the question words they carry, preferring the most trusted pages.
         # Variant words are left out of the bar; a missing variant leads to an honest decline below.
         bar = 0.4 * sum(self.idf[word] for word in known - VARIANTS)
-        scored = []
+        # A more trusted page whose best rows lack a variant the question names ("introductory" for the Achieve
+        # Money Market offer) gives way to a page whose rows carry it, before the rate is called unlisted.
+        named = (words & VARIANTS) - excluded
+        scored = fallback = None
         for trust in (3, 2):
             tier = [row for row in self.rows if row.trust == trust]
             if products:
@@ -382,10 +425,16 @@ class RateIndex:
                 tier = [row for row in tier if products & (row.product | row.shape)] or [
                     row for row in tier if products & row.tokens
                 ]
-            scored = [(sum(self.idf[word] for word in known & row.tokens), row) for row in tier]
-            if scored and max(score for score, _ in scored) >= bar:
+            candidates = [(sum(self.idf[word] for word in known & row.tokens), row) for row in tier]
+            top = max((score for score, _ in candidates), default=0.0)
+            if not candidates or top < bar:
+                continue
+            if named <= set().union(*(row.tokens for score, row in candidates if score >= 0.75 * top)):
+                scored = candidates
                 break
-        else:
+            fallback = fallback or candidates
+        scored = scored or fallback
+        if scored is None:
             return None
         best = max(score for score, _ in scored)
         pool = [(score, row) for score, row in scored if score >= 0.75 * best]
@@ -439,10 +488,15 @@ class RateIndex:
             if several or all(row.variants - words for row in rows):
                 return None
 
-        metric = self._metric(question)
+        metrics = self._metrics(question)
+        # An offer's figures for the introductory period and for after it are kept apart.
+        wanted_period = "after" if ASKS_AFTER.search(question) else "intro" if INTRO_PERIOD.search(question) else ""
 
         def shown(row: RateRow) -> list[tuple[str, str, Decimal]]:
-            return [value for value in row.values if value[0] == metric] or list(row.values)
+            values = [value for value in row.values if value[0] in metrics] or list(row.values)
+            if wanted_period:
+                values = [value for value in values if _period(value[1]) in (wanted_period, "")] or values
+            return values
 
         if HIGHEST.search(question) or LOWEST.search(question):
             pick = max if HIGHEST.search(question) else min
@@ -476,14 +530,13 @@ class RateIndex:
         return {word for word in words if word not in self.idf}
 
     @staticmethod
-    def _metric(question: str) -> Optional[str]:
-        """The figure the question asks for. One it sets aside ("the dividend rate, rather than APY", "the
-        interest rate before APR") doesn't count."""
-        for metric, pattern in METRICS:
-            for match in pattern.finditer(question):
-                if not SET_ASIDE.search(question[: match.start()]):
-                    return metric
-        return None
+    def _metrics(question: str) -> set[str]:
+        """The figures the question asks for ("the interest rate and APR" asks for both). One it sets aside
+        ("the dividend rate, rather than APY", "the interest rate before APR") doesn't count."""
+        return {
+            metric for metric, pattern in METRICS
+            if any(not SET_ASIDE.search(question[: match.start()]) for match in pattern.finditer(question))
+        }
 
     def conflicts(self, reported: set) -> list[Conflict]:
         """Report tiers that different pages publish with different values, resolved by page rank.
@@ -493,10 +546,11 @@ class RateIndex:
         groups = defaultdict(list)
         for row in self.rows:
             for kind, text, value in row.values:
-                groups[(kind, row.shape, row.term, row.variants)].append((row, text, value))
+                # An offer's introductory and after-promotion figures are different rates, not a contradiction.
+                groups[(kind, _period(text), row.shape, row.term, row.variants)].append((row, text, value))
 
         found: dict[tuple, Conflict] = {}
-        for (kind, _, term, _), entries in groups.items():
+        for (kind, period, _, term, _), entries in groups.items():
             for position, (winner, winning_text, winning_value) in enumerate(entries):
                 if winner.trust < 2 or any(
                     earlier.label_key == winner.label_key and earlier.amount == winner.amount
@@ -510,15 +564,15 @@ class RateIndex:
                     and _years_overlap(winner.years, loser.years) and self._same_product(winner, loser)
                 ]
                 if losers:
-                    found[(kind, winner.product, winner.label_key, winner.years)] = self._conflict(
+                    found[(kind, period, winner.product, winner.label_key, winner.years)] = self._conflict(
                         kind, term, winner, winning_text, losers,
                     )
 
         conflicts = []
-        for (kind, *tier), conflict in found.items():
+        for (kind, period, *tier), conflict in found.items():
             # The yield or APR conflict covers the same row's dividend or interest-rate conflict.
             headline = {"dividend rate": "APY", "interest rate": "APR"}.get(kind)
-            if headline and (headline, *tier) in found:
+            if headline and (headline, period, *tier) in found:
                 continue
             product, label_key, years = tier
             # Captions are reworded between snapshots, so one caption containing the other is the same product.
