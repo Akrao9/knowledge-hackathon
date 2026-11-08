@@ -31,6 +31,7 @@ MAX_FALLBACK_CHARS = 600
 SEARCH_SECTIONS = 8
 LUNA_SECTIONS = 16
 COMPACT_PASSAGES = 2
+LUNA_QUOTES = 3
 # The site repeats some passages word for word on several pages (a footnote on both the product page
 # and the rate sheet). An answer cites every page that carries its quote's opening passage, as long as
 # that passage is long enough to be specific.
@@ -400,10 +401,10 @@ def _best_pieces(pieces: list[str], rarity: dict[str, float], count: int) -> lis
     return sorted(index for _, index in best)
 
 
-def _quote_answer(question: str, evidence: list[tuple[Section, str]]) -> Answer:
+def _quote_answer(question: str, evidence: list[tuple[Section, str]], limit: Optional[int] = None) -> Answer:
     # A comparison shows up to three passages, and a question naming several places one passage per place.
     places = len(_named_place(question) or ())
-    limit = 3 if COMPARISON.search(question) else places or 1
+    limit = limit or (3 if COMPARISON.search(question) else places or 1)
     quotes = []
     sources = []
     seen = set()
@@ -852,7 +853,9 @@ class SnapshotKnowledge:
             evidence.append((section, quote))
         if not evidence:
             return Answer(text="I don't know.", confident=False)
-        return _quote_answer(question, evidence)
+        # Luna chooses the fewest passages that answer, so a two-part question ("the largest grant, and how
+        # recently must the event have happened?") shows each section it chose, up to three.
+        return _quote_answer(question, evidence, limit=min(len(evidence), LUNA_QUOTES))
 
     def conflicts(self) -> list[Conflict]:
         """Report each contradiction once, from the newest snapshot where it appears."""

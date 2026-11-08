@@ -77,7 +77,9 @@ NOT_A_RATE_LOOKUP = re.compile(
     # "How does it work?" asks for an explanation, but "how does the purchase APR compare with the refinance APR?"
     # asks for two rates.
     r"\b(?:links?|urls?|calculat\w*|why|explain\w*|history|historical|penalt\w*|fees?)\b"
-    r"|\bhow (?:do|does|can|is|are)\b(?![^?]*\bcompare)",
+    r"|\bhow (?:do|does|can|is|are)\b(?![^?]*\bcompare)"
+    # A period or an opening deposit ("how many days ... to post", "how much ... to open") isn't a table rate.
+    r"|\bhow many (?:days|weeks|months|years)\b|\bhow long\b|\bto open\b",
     re.IGNORECASE,
 )
 # The figures a rate table publishes. "Yield" inside a name ("High-Yield Savings") names the product, not the APY.
