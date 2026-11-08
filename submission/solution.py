@@ -4,7 +4,7 @@ import re
 import sys
 from calendar import monthrange
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from math import log1p
 from pathlib import Path
@@ -30,6 +30,11 @@ MAX_FALLBACK_CHARS = 600
 SEARCH_SECTIONS = 8
 LUNA_SECTIONS = 16
 COMPACT_PASSAGES = 2
+# The site repeats some passages word for word on several pages (a footnote on both the product page
+# and the rate sheet). An answer cites every page that carries its quote's opening passage, as long as
+# that passage is long enough to be specific.
+MIN_COPY_CHARS = 40
+MAX_SOURCES = 8
 STOP_WORDS = frozenset(
     "a an and are as at be can could did do does for from how i in is it me my of on or s "
     "tell that the their this to was were what when where which who will with would you your".split()
@@ -377,6 +382,20 @@ def _quote_answer(question: str, evidence: list[tuple[Section, str]]) -> Answer:
     return Answer(text="\n\n".join(quotes), sources=sources)
 
 
+def _flatten(text: str) -> str:
+    """Text in one case with all whitespace runs as single spaces, so line wrapping does not matter."""
+    return " ".join(text.split()).lower()
+
+
+def _opening_passage(quote: str) -> str:
+    """The first paragraph of a quote that is not just an image, flattened."""
+    for paragraph in quote.split("\n\n"):
+        flat = _flatten(MARKDOWN_IMAGE.sub("", paragraph))
+        if flat:
+            return flat
+    return ""
+
+
 def _question_date(question: str) -> Optional[str]:
     """The date a question asks about in its own words, if any; "as of May 2026" means the end of May."""
     match = AS_OF_DATE.search(question)
@@ -522,6 +541,7 @@ class SnapshotKnowledge:
         self._links_by_snapshot: dict[str, list[Section]] = {}
         self._rates_by_snapshot: dict[str, RateIndex] = {}
         self._facts_by_snapshot: dict[str, SnapshotFacts] = {}
+        self._pages_by_snapshot: dict[str, list[tuple[str, str]]] = {}  # (url, flattened text) per page
         self._answers: dict[tuple[str, Optional[str]], Answer] = {}
 
     def ingest(self, snapshot: Snapshot) -> None:
@@ -560,6 +580,7 @@ class SnapshotKnowledge:
         self._links_by_snapshot[snapshot.snapshot_id] = links
         self._rates_by_snapshot[snapshot.snapshot_id] = RateIndex(snapshot)
         self._facts_by_snapshot[snapshot.snapshot_id] = facts
+        self._pages_by_snapshot[snapshot.snapshot_id] = [(page.url, _flatten(page.markdown)) for page in snapshot.pages]
         self.snapshots.append(snapshot)
 
     def _snapshot_for(self, as_of: Optional[str]) -> Optional[Snapshot]:
@@ -630,8 +651,24 @@ class SnapshotKnowledge:
         """Answer from the snapshot for the date; a repeated question gets the answer it got the first time."""
         key = (question, as_of)
         if key not in self._answers:
-            self._answers[key] = self._answer(question, as_of)
+            self._answers[key] = self._with_copies(self._answer(question, as_of))
         return self._answers[key]
+
+    def _with_copies(self, answer: Answer) -> Answer:
+        """Also cite the other pages of the same snapshot that publish a quote's opening passage."""
+        sources = list(answer.sources)
+        cited = {source.url for source in sources}
+        for source in answer.sources:
+            opening = _opening_passage(source.quote or "")
+            if len(opening) < MIN_COPY_CHARS:
+                continue
+            for url, text in self._pages_by_snapshot.get(source.snapshot_id, []):
+                if len(sources) >= MAX_SOURCES:
+                    break
+                if url not in cited and opening in text:
+                    cited.add(url)
+                    sources.append(Source(url=url, snapshot_id=source.snapshot_id, quote=source.quote))
+        return replace(answer, sources=sources) if len(sources) > len(answer.sources) else answer
 
     def _answer(self, question: str, as_of: Optional[str]) -> Answer:
         if as_of is None:
