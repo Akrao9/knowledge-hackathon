@@ -68,7 +68,13 @@ PHONE_QUESTION = re.compile(
     r"|\b(?:dial\w*|reach\w*|phone|contact\w*)\b[^?]*\bextensions?\b",
     re.IGNORECASE,
 )
-NOT_A_PHONE_QUESTION = re.compile(r"\b(?:routing|aba|account number|card number)\b", re.IGNORECASE)
+# Not a number to call: other numbers, or the member's own phone number being added or changed
+# ("add a phone number for two-step verification texts").
+NOT_A_PHONE_QUESTION = re.compile(
+    r"\b(?:routing|aba|account number|card number)\b"
+    r"|\b(?:add|update|chang|register|enter|remov)\w*\s+(?:(?:a|an|my|your|the|new|another)\s+)*phone numbers?\b",
+    re.IGNORECASE,
+)
 # A search term no word can produce: sections with a phone number carry it, and questions asking for one
 # search only those sections.
 PHONE_TERM = "<phone>"
@@ -138,6 +144,12 @@ PERSONAL_QUESTION = re.compile(
     re.IGNORECASE,
 )
 PERSONAL_ANSWER = "I don't know. Dupaco's public website doesn't show personal account details or individual loan decisions."
+# The exact figure for the member's own case ("What exact fee would my business pay?", "my specific application"),
+# not a published one ("What APY applies to exactly $5,000?"). When the quoted page itself says the figure varies,
+# it can't give that answer.
+EXACT_FOR_MEMBER = re.compile(r"^(?=[^?]*\b(?:exact|specific)\b)(?=[^?]*\b(?:my|me|i)\b)", re.IGNORECASE)
+VARIES = re.compile(r"\b(?:vary|varies|varied|depends?|depending)\b", re.IGNORECASE)
+VARIES_ANSWER = "I don't know the exact figure for your case. Dupaco's website says it varies:"
 COMPARISON = re.compile(
     r"\bcompare\b|\b(?:all|every|each)\b.{0,100}\b(?:same|identical)\b|\b(?:same|identical)\b.{0,60}\b(?:all|every|each)\b"
     r"|\b(?:differ|vary)\b.{0,60}\b(?:by|between|across|from)\b",
@@ -208,8 +220,11 @@ def _rank_terms(text: str, *, phrases: bool = False) -> set[str]:
 
 
 def _is_teaser(url: str, headings: tuple[str, ...], text: str) -> bool:
-    """Blurbs that advertise other articles ("Handpicked for You", "Keep reading", card titles linking away)."""
-    if any(heading in TEASER_HEADINGS for heading in headings) or "[Keep reading](" in text:
+    """Blurbs that advertise other articles ("Handpicked for You", "Keep reading", card titles linking away).
+
+    Only the section's own heading counts, so "The Fine Print" below a teaser block is still indexed.
+    """
+    if (headings and headings[-1] in TEASER_HEADINGS) or "[Keep reading](" in text:
         return True
     card = LINKED_HEADING.match(headings[-1]) if headings else None
     return bool(card) and urlsplit(card[1]).path.rstrip("/") != urlsplit(url).path.rstrip("/")
@@ -651,7 +666,10 @@ class SnapshotKnowledge:
         """Answer from the snapshot for the date; a repeated question gets the answer it got the first time."""
         key = (question, as_of)
         if key not in self._answers:
-            self._answers[key] = self._with_copies(self._answer(question, as_of))
+            answer = self._answer(question, as_of)
+            if answer.confident and EXACT_FOR_MEMBER.search(question) and VARIES.search(answer.text):
+                answer = replace(answer, text=f"{VARIES_ANSWER}\n\n{answer.text}", confident=False)
+            self._answers[key] = self._with_copies(answer)
         return self._answers[key]
 
     def _with_copies(self, answer: Answer) -> Answer:

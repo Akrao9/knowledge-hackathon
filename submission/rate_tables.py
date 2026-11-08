@@ -42,7 +42,7 @@ NEGATED = re.compile(
 ROW_AMOUNT = re.compile(
     r"\$\s*(\d[\d,]*(?:\.\d+)?)\s*(?:(\+)|[-–—]\s*\$?\s*(\d[\d,]*(?:\.\d+)?)|(or less))?", re.IGNORECASE,
 )
-QUESTION_AMOUNT = re.compile(r"\$\s*(\d[\d,]*(?:\.\d+)?)\s*([km])?\b", re.IGNORECASE)
+QUESTION_AMOUNT = re.compile(r"\$\s*(\d[\d,]*(?:\.\d+)?)\s*(k|m|thousand|million)?\b", re.IGNORECASE)
 
 STOP_WORDS = frozenset(
     "a an and are as at be by can could did do does for from have how i in is it me my of on or our s "
@@ -75,6 +75,14 @@ NOT_A_RATE_LOOKUP = re.compile(
     r"\b(?:links?|urls?|calculat\w*|why|explain\w*|history|historical|penalt\w*|fees?|how (?:do|does|can|is|are))\b",
     re.IGNORECASE,
 )
+# The figures a rate table publishes. "Yield" inside a name ("High-Yield Savings") names the product, not the APY.
+METRICS = (
+    ("APY", re.compile(r"\bapy\b|annual percentage yield|(?<!-)\byields?\b", re.IGNORECASE)),
+    ("dividend rate", re.compile(r"\bdividend", re.IGNORECASE)),
+    ("APR", re.compile(r"\bapr\b|annual percentage rate", re.IGNORECASE)),
+    ("interest rate", re.compile(r"\binterest rate", re.IGNORECASE)),
+)
+SET_ASIDE = re.compile(r"\b(?:rather than|instead of|other than|not|before|excluding)\s+(?:the\s+|an?\s+)?$", re.IGNORECASE)
 # Words that ask for the rate itself, unlike "earn dividends", "High-Yield Savings" or "principal and interest".
 RATE_FIGURE = re.compile(r"\b(?:rates?|aprs?|apys?|percent(?:age)?)\b|%", re.IGNORECASE)
 LIST_INTENT = re.compile(r"\b(?:all|every|list|offer\w*|options|available|types|kinds)\b|\bwhat\b.*\bdo you have\b", re.I)
@@ -392,7 +400,7 @@ class RateIndex:
         years = {int(year) for year in QUESTION_MODEL_YEAR.findall(question)}
         terms = _term_months(question)
         amounts = [
-            _decimal(amount) * {"": 1, "k": 1000, "m": 1000000}[suffix.lower()]
+            _decimal(amount) * {"": 1, "k": 1000, "thousand": 1000, "m": 1000000, "million": 1000000}[suffix.lower()]
             for amount, suffix in QUESTION_AMOUNT.findall(question)
         ]
         for wanted, attribute, fits in (
@@ -469,15 +477,12 @@ class RateIndex:
 
     @staticmethod
     def _metric(question: str) -> Optional[str]:
-        question = question.lower()
-        if re.search(r"\bapy\b|yield", question):
-            return "APY"
-        if re.search(r"\bdividend", question):
-            return "dividend rate"
-        if re.search(r"\bapr\b|annual percentage rate", question):
-            return "APR"
-        if "interest rate" in question:
-            return "interest rate"
+        """The figure the question asks for. One it sets aside ("the dividend rate, rather than APY", "the
+        interest rate before APR") doesn't count."""
+        for metric, pattern in METRICS:
+            for match in pattern.finditer(question):
+                if not SET_ASIDE.search(question[: match.start()]):
+                    return metric
         return None
 
     def conflicts(self, reported: set) -> list[Conflict]:
