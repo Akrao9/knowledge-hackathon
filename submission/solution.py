@@ -393,7 +393,9 @@ def _best_pieces(pieces: list[str], rarity: dict[str, float], count: int) -> lis
 
 
 def _quote_answer(question: str, evidence: list[tuple[Section, str]]) -> Answer:
-    limit = 3 if COMPARISON.search(question) else 1
+    # A comparison shows up to three passages, and a question naming several places one passage per place.
+    places = len(_named_place(question) or ())
+    limit = 3 if COMPARISON.search(question) else places or 1
     quotes = []
     sources = []
     seen = set()
@@ -406,6 +408,9 @@ def _quote_answer(question: str, evidence: list[tuple[Section, str]]) -> Answer:
         seen.add(key)
         if section.link_target and section.link_target not in quote:
             quotes.append(f"[View page]({section.link_target})")
+        elif places > 1 and section.heading_path:
+            # Each place's passage is named by the title of the page it comes from.
+            quotes.append(f"{section.heading_path[0]}: {shown}")
         else:
             quotes.append(_with_subject(question, section, shown))
         sources.append(Source(url=section.url, snapshot_id=section.snapshot_id, quote=quote))
@@ -727,6 +732,9 @@ class SnapshotKnowledge:
             self._answers[key] = self._with_copies(answer)
         return self._answers[key]
 
+    def _page_text(self, section: Section) -> str:
+        return next((text for url, text in self._pages_by_snapshot[section.snapshot_id] if url == section.url), "")
+
     def _with_copies(self, answer: Answer) -> Answer:
         """Also cite the other pages of the same snapshot that publish a quote's opening passage."""
         sources = list(answer.sources)
@@ -815,7 +823,10 @@ class SnapshotKnowledge:
         evidence = []
         for section, texts in picked.values():
             quote = "\n\n".join(text for _, text in sorted(texts.items()))
-            if not _mentions(section, place, quote if needs_schedule else section.text[:MAX_SECTION_CHARS]):
+            if not _mentions(section, place, quote if needs_schedule else section.text[:MAX_SECTION_CHARS]) and not (
+                # An announcement is about the branch it names, even where its hours section doesn't repeat the name.
+                _is_article(section.url) and _mentions(section, place, self._page_text(section))
+            ):
                 continue
             if needs_schedule and not _supports_hours(question, quote):
                 continue
