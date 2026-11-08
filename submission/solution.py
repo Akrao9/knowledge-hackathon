@@ -379,9 +379,17 @@ def _numbered_passages(section: Section) -> list[str]:
         lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
         if lines and all(TABLE_LINE.match(line) for line in lines):
             pieces.extend(line for line in lines if not TABLE_RULE.fullmatch(line))
+        elif lines and pieces and HOURS_DAY.match(lines[0]) and _is_schedule_piece(pieces[-1]):
+            # A schedule typed one day per paragraph stays one passage with its "**Lobby**" label.
+            pieces[-1] += "\n\n" + paragraph.strip()
         elif lines:
             pieces.append(paragraph.strip())
     return pieces
+
+
+def _is_schedule_piece(piece: str) -> bool:
+    last = piece.splitlines()[-1].strip()
+    return bool(HOURS_LABEL.fullmatch(last) or HOURS_DAY.match(last))
 
 
 def _best_pieces(pieces: list[str], rarity: dict[str, float], count: int) -> list[int]:
@@ -465,6 +473,15 @@ def _question_date(question: str) -> Optional[str]:
         return date(year, month, day).isoformat()
     except ValueError:
         return None
+
+
+def _names_place(text: str, places: Optional[tuple[frozenset[str], ...]]) -> bool:
+    """True when the text names one of the places as consecutive words ("East Washington Avenue")."""
+    words = [STREET_WORDS.get(word, word) for word in RANK_WORD.findall(text.lower())]
+    return any(
+        set(words[start:start + len(place)]) == place
+        for place in places or () for start in range(len(words) - len(place) + 1)
+    )
 
 
 def _place_words(text: str) -> set[str]:
@@ -733,7 +750,9 @@ class SnapshotKnowledge:
         return self._answers[key]
 
     def _page_text(self, section: Section) -> str:
-        return next((text for url, text in self._pages_by_snapshot[section.snapshot_id] if url == section.url), "")
+        """The indexed text of the section's page, without teasers for other articles."""
+        sections = self._sections_by_snapshot[section.snapshot_id].values()
+        return "\n\n".join(other.text for other in sections if other.url == section.url)
 
     def _with_copies(self, answer: Answer) -> Answer:
         """Also cite the other pages of the same snapshot that publish a quote's opening passage."""
@@ -825,7 +844,7 @@ class SnapshotKnowledge:
             quote = "\n\n".join(text for _, text in sorted(texts.items()))
             if not _mentions(section, place, quote if needs_schedule else section.text[:MAX_SECTION_CHARS]) and not (
                 # An announcement is about the branch it names, even where its hours section doesn't repeat the name.
-                _is_article(section.url) and _mentions(section, place, self._page_text(section))
+                _is_article(section.url) and _names_place(self._page_text(section), place)
             ):
                 continue
             if needs_schedule and not _supports_hours(question, quote):
