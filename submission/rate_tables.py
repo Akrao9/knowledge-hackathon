@@ -74,7 +74,10 @@ VARIANTS = frozenset(
 
 RATE_QUESTION = re.compile(r"\b(?:rates?|aprs?|apys?|yield|dividends?|interest|percent(?:age)?|pays?|earns?)\b|%", re.I)
 NOT_A_RATE_LOOKUP = re.compile(
-    r"\b(?:links?|urls?|calculat\w*|why|explain\w*|history|historical|penalt\w*|fees?|how (?:do|does|can|is|are))\b",
+    # "How does it work?" asks for an explanation, but "how does the purchase APR compare with the refinance APR?"
+    # asks for two rates.
+    r"\b(?:links?|urls?|calculat\w*|why|explain\w*|history|historical|penalt\w*|fees?)\b"
+    r"|\bhow (?:do|does|can|is|are)\b(?![^?]*\bcompare)",
     re.IGNORECASE,
 )
 # The figures a rate table publishes. "Yield" inside a name ("High-Yield Savings") names the product, not the APY.
@@ -87,6 +90,7 @@ METRICS = (
 SET_ASIDE = re.compile(r"\b(?:rather than|instead of|other than|not|before|excluding)\s+(?:the\s+|an?\s+)?$", re.IGNORECASE)
 # Words that ask for the rate itself, unlike "earn dividends", "High-Yield Savings" or "principal and interest".
 RATE_FIGURE = re.compile(r"\b(?:rates?|aprs?|apys?|percent(?:age)?)\b|%", re.IGNORECASE)
+COMPARES = re.compile(r"\bcompar\w*|\bversus\b|\bvs\b|\bdifference between\b", re.IGNORECASE)
 LIST_INTENT = re.compile(r"\b(?:all|every|list|offer\w*|options|available|types|kinds)\b|\bwhat\b.*\bdo you have\b", re.I)
 HIGHEST = re.compile(r"\b(?:highest|best|top|max(?:imum)?|most)\b", re.IGNORECASE)
 LOWEST = re.compile(r"\b(?:lowest|cheapest|min(?:imum)?|least)\b", re.IGNORECASE)
@@ -476,14 +480,16 @@ class RateIndex:
             ]
 
         best = max(score for score, _ in pool)
-        rows = [row for score, row in pool if score >= best - 1e-9]
+        # A comparison ("how does the purchase APR compare with the refinance APR?") keeps each side's rows.
+        compares = bool(COMPARES.search(question))
+        rows = [row for score, row in pool if compares or score >= best - 1e-9]
         carried = set().union(*(row.tokens for row in rows))
         if (words & VARIANTS) - carried:
             return Answer(text=NOT_LISTED, confident=False)
         # A word the rows don't carry ("kids savings", "signature loan", "personal line of credit") may name
         # a product the tables call something else. If the rows span several products, or are all a variant
         # the question didn't ask for, guessing would quote another product's rate, so search answers instead.
-        if words - GENERIC - carried and not LIST_INTENT.search(question):
+        if words - GENERIC - carried and not LIST_INTENT.search(question) and not compares:
             several = len({row.product for row in rows}) > 1
             if several or all(row.variants - words for row in rows):
                 return None

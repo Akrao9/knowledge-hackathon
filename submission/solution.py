@@ -6,6 +6,7 @@ from calendar import monthrange
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import date
+from decimal import Decimal
 from math import log1p
 from pathlib import Path
 from typing import Optional
@@ -114,6 +115,8 @@ LINK_WORDS = frozenset("dupaco link look see show should use url view web websit
 BRANCH_QUESTION = re.compile(r"\b(?:hours?|open|closes?|closed|closing|address|located|location|directions)\b", re.I)
 PLACE_BEFORE_BRANCH = re.compile(r"((?:[\w.'&-]+\s+){1,3})(?:branch|location|office)\b(?!es)", re.IGNORECASE)
 PLACE_AFTER_PREPOSITION = re.compile(r"\b(?:at|for|in|near)\s+((?:[\w.'&-]+\s*){1,3})", re.IGNORECASE)
+PLACE_PARTS = re.compile(r"\band\b", re.IGNORECASE)
+DETERMINERS = frozenset({"the", "a", "an", "this", "that", "each", "every", "any", "your", "our"})
 PLACE_STOP_WORDS = frozenset(
     "a about all an and any are at banking branch branches can close closed closes closing do does dupaco "
     "each every for full general hour hours how in is it its location locations lobby main member members "
@@ -150,6 +153,20 @@ PERSONAL_ANSWER = "I don't know. Dupaco's public website doesn't show personal a
 EXACT_FOR_MEMBER = re.compile(r"^(?=[^?]*\b(?:exact|specific)\b)(?=[^?]*\b(?:my|me|i)\b)", re.IGNORECASE)
 VARIES = re.compile(r"\b(?:vary|varies|varied|depends?|depending)\b", re.IGNORECASE)
 VARIES_ANSWER = "I don't know the exact figure for your case. Dupaco's website says it varies:"
+# A question asking for an exact figure ("What's the exact application deadline?", "What exact penalty formula
+# does Dupaco publish?") that the quoted passage doesn't give: it states no number beyond the question's own.
+EXACT_FIGURE = re.compile(
+    r"\bexact\b[^?]*\b(?:deadline|date|time|fee|charge|cost|price|rate|apr|apy|amount|limit|formula|penalty|percent\w*)",
+    re.IGNORECASE,
+)
+FIGURE = re.compile(r"\d+(?:[.,]\d+)*")
+# A fee rule ("$10.00 or 3.00% of the amount of each cash advance, whichever is greater") worked out for the
+# amounts a question gives ("a $200 cash advance and a separate $500 cash advance").
+FEE_RULE = re.compile(
+    r"\$\s?(\d[\d,]*(?:\.\d+)?)\s+or\s+(\d+(?:\.\d+)?)%\s+of\b[^.]*?\bwhichever is (greater|less)", re.IGNORECASE
+)
+DOLLARS = re.compile(r"\$\s?(\d[\d,]*(?:\.\d+)?)")
+NO_FIGURE_ANSWER = "I don't know the exact figure. Dupaco's website doesn't publish it; the closest passage says:"
 COMPARISON = re.compile(
     r"\bcompare\b|\b(?:all|every|each)\b.{0,100}\b(?:same|identical)\b|\b(?:same|identical)\b.{0,60}\b(?:all|every|each)\b"
     r"|\b(?:differ|vary)\b.{0,60}\b(?:by|between|across|from)\b",
@@ -397,6 +414,22 @@ def _quote_answer(question: str, evidence: list[tuple[Section, str]]) -> Answer:
     return Answer(text="\n\n".join(quotes), sources=sources)
 
 
+def _with_fee_amounts(question: str, answer: Answer) -> Answer:
+    """Add what a quoted "$X or Y% of the amount, whichever is greater" fee comes to for each amount asked about."""
+    rule = FEE_RULE.search(answer.text) if answer.confident else None
+    amounts = [Decimal(amount.replace(",", "")) for amount in DOLLARS.findall(question)]
+    if not rule or not amounts:
+        return answer
+    flat, percent = Decimal(rule[1].replace(",", "")), Decimal(rule[2])
+    pick = max if rule[3].lower() == "greater" else min
+    worked = "; ".join(f"${amount:,.2f}: ${pick(flat, amount * percent / 100):,.2f}" for amount in amounts)
+    return replace(answer, text=f"{answer.text}\n\nWorked out for the amounts asked about: {worked}.")
+
+
+def _figures(text: str) -> set[str]:
+    return {figure.replace(",", "") for figure in FIGURE.findall(text)}
+
+
 def _flatten(text: str) -> str:
     """Text in one case with all whitespace runs as single spaces, so line wrapping does not matter."""
     return " ".join(text.split()).lower()
@@ -433,20 +466,39 @@ def _place_words(text: str) -> set[str]:
     return {STREET_WORDS.get(word, word) for word in RANK_WORD.findall(text.lower())}
 
 
-def _named_place(question: str) -> Optional[frozenset[str]]:
-    """The words naming a branch or location the question asks about, if any."""
+def _named_place(question: str) -> Optional[tuple[frozenset[str], ...]]:
+    """The words naming each branch or location the question asks about, if any.
+
+    A question can name two places joined by "and" ("hours at the Crosse Pointe Learning Lab and at the East
+    Washington Avenue branch"); each part contributes the first place it names.
+    """
     if not BRANCH_QUESTION.search(question):
         return None
+    places = []
+    for part in PLACE_PARTS.split(question):
+        place = _first_place(part)
+        if place and place not in places:
+            places.append(place)
+    return tuple(places) or None
+
+
+def _first_place(text: str) -> Optional[frozenset[str]]:
     for pattern in (PLACE_BEFORE_BRANCH, PLACE_AFTER_PREPOSITION):
-        for match in pattern.finditer(question):
+        for match in pattern.finditer(text):
+            # "the branch announcements" mentions branches without naming one.
+            if pattern is PLACE_BEFORE_BRANCH and match[1].split()[-1].lower() in DETERMINERS:
+                continue
             words = _place_words(match[1]) - PLACE_STOP_WORDS
             if words and not all(word.isdigit() for word in words):
                 return frozenset(words)
     return None
 
 
-def _mentions(section: Section, place: Optional[frozenset[str]], passage: str) -> bool:
-    return place is None or place <= _place_words(f"{section.page_title} {' '.join(section.heading_path)} {passage}")
+def _mentions(section: Section, places: Optional[tuple[frozenset[str], ...]], passage: str) -> bool:
+    if places is None:
+        return True
+    words = _place_words(f"{section.page_title} {' '.join(section.heading_path)} {passage}")
+    return any(place <= words for place in places)
 
 
 def _supports_hours(question: str, passage: str) -> bool:
@@ -667,8 +719,11 @@ class SnapshotKnowledge:
         key = (question, as_of)
         if key not in self._answers:
             answer = self._answer(question, as_of)
+            answer = _with_fee_amounts(question, answer)
             if answer.confident and EXACT_FOR_MEMBER.search(question) and VARIES.search(answer.text):
                 answer = replace(answer, text=f"{VARIES_ANSWER}\n\n{answer.text}", confident=False)
+            elif answer.confident and EXACT_FIGURE.search(question) and not _figures(answer.text) - _figures(question):
+                answer = replace(answer, text=f"{NO_FIGURE_ANSWER}\n\n{answer.text}", confident=False)
             self._answers[key] = self._with_copies(answer)
         return self._answers[key]
 
