@@ -89,6 +89,10 @@ METRICS = (
     ("APR", re.compile(r"\bapr\b|annual percentage rate", re.IGNORECASE)),
     ("interest rate", re.compile(r"\binterest rate", re.IGNORECASE)),
 )
+RATE_AND_FIGURE = re.compile(r"\brates?\s+and\s+(?:the\s+|its\s+)?ap[ry]\b|\bap[ry]\s+and\s+(?:the\s+|its\s+)?rates?\b", re.I)
+ADJUSTMENT = re.compile(
+    r"(?P<name>[A-Z][\w&-]*(?:[ -][A-Z][\w&-]*){0,3})\s*:\s*Add (?P<points>\d+(?:\.\d+)?)%\s+to\s+(?:the\s+)?conventional rates"
+)
 SET_ASIDE = re.compile(r"\b(?:rather than|instead of|other than|not|before|excluding)\s+(?:the\s+|an?\s+)?$", re.IGNORECASE)
 # Words that ask for the rate itself, unlike "earn dividends", "High-Yield Savings" or "principal and interest".
 RATE_FIGURE = re.compile(r"\b(?:rates?|aprs?|apys?|percent(?:age)?)\b|%", re.IGNORECASE)
@@ -361,8 +365,14 @@ def _years_overlap(left: Optional[tuple], right: Optional[tuple]) -> bool:
 class RateIndex:
     def __init__(self, snapshot: Snapshot):
         self.rows: list[RateRow] = []
+        # Published adjustments to a table ("Mini-Max Loans: Add 1% to conventional rates"): name words -> (name, points).
+        self.adjustments: dict[frozenset, tuple[str, Decimal]] = {}
         for page in snapshot.pages:
             self.rows.extend(read_rate_rows(page, snapshot.snapshot_id, snapshot.taken_on))
+            for match in ADJUSTMENT.finditer(page.markdown):
+                name_words = frozenset(_tokens(match["name"])) - GENERIC - PRODUCT_NOUNS
+                if name_words:
+                    self.adjustments[name_words] = (match["name"], Decimal(match["points"]))
         self.rows.sort(key=RateRow.rank, reverse=True)
         counts = Counter(token for row in self.rows for token in row.tokens)
         self.idf = {token: log((len(self.rows) + 1) / (count + 0.5)) for token, count in counts.items()}
@@ -418,10 +428,19 @@ class RateIndex:
 
         # Score rows by the rarity of the question words they carry, preferring the most trusted pages.
         # Variant words are left out of the bar; a missing variant leads to an honest decline below.
-        bar = 0.4 * sum(self.idf[word] for word in known - VARIANTS)
+        # Words no row of the product carries ("standard personal 30-month certificate") can't be matched by any row,
+        # so they don't raise the bar; the check on uncarried words below still applies.
+        family = [row for row in self.rows if not products or products & (row.product | row.shape | row.tokens)]
+        reachable = set().union(*(row.tokens for row in family))
+        bar = 0.4 * sum(self.idf[word] for word in (known - VARIANTS) & reachable)
         # A more trusted page whose best rows lack a variant the question names ("introductory" for the Achieve
         # Money Market offer) gives way to a page whose rows carry it, before the rate is called unlisted.
         named = (words & VARIANTS) - excluded
+        # So does one whose top rows lack the rarest question word any row of the product carries ("Achieve" for the
+        # Achieve Money Market offer, which the rate sheet's money market rows don't name).
+        distinctive = (known - VARIANTS) & reachable
+        if distinctive:
+            named = named | {max(distinctive, key=lambda word: self.idf[word])}
         scored = fallback = None
         for trust in (3, 2):
             tier = [row for row in self.rows if row.trust == trust]
@@ -492,7 +511,10 @@ class RateIndex:
         # a product the tables call something else. If the rows span several products, or are all a variant
         # the question didn't ask for, guessing would quote another product's rate, so search answers instead.
         if words - GENERIC - carried and not LIST_INTENT.search(question) and not compares:
-            several = len({row.product for row in rows}) > 1
+            # Captions reworded between pages ("Auto Loans", "Auto & Motorcycle Loans") are one product.
+            several = any(
+                not (left.product <= right.product or right.product <= left.product) for left in rows for right in rows
+            )
             if several or all(row.variants - words for row in rows):
                 return None
 
@@ -508,7 +530,9 @@ class RateIndex:
 
         if HIGHEST.search(question) or LOWEST.search(question):
             pick = max if HIGHEST.search(question) else min
-            rows = [pick(rows, key=lambda row: shown(row)[0][2])]
+            # Rows tied at the top value are all shown ("the 6- and 12-month certificates tie at 3.40%").
+            top = pick(shown(row)[0][2] for row in rows)
+            rows = [row for row in rows if shown(row)[0][2] == top]
 
         # Rows arrive best-ranked first, so the first row for a tier wins over other pages' copies.
         unique: list[RateRow] = []
@@ -529,6 +553,14 @@ class RateIndex:
                 if all(copy.url != source.url for source in sources):
                     sources.append(copy.source())
         text = lines[0] + "." if len(lines) == 1 else "Published rates:\n" + "\n".join(f"- {line}" for line in lines)
+        for name_words, (name, points) in self.adjustments.items():
+            # The question names a published adjustment ("if I apply the Mini-Max adjustment"): apply it to the rate.
+            if name_words <= words and len(unique) == 1:
+                adjusted = ", ".join(
+                    f"{value + points}% {kind}" for kind, _, value in shown(unique[0]) if kind in ("APR", "interest rate")
+                )
+                if adjusted:
+                    text += f"\n\nWith {name} (the page says to add {points}% to conventional rates): {adjusted}."
         note = "Pages disagree on this rate; the answer uses the most authoritative, most recently effective table." if overruled else None
         return Answer(text=text, sources=sources[:6], conflict_note=note)
 
@@ -541,10 +573,14 @@ class RateIndex:
     def _metrics(question: str) -> set[str]:
         """The figures the question asks for ("the interest rate and APR" asks for both). One it sets aside
         ("the dividend rate, rather than APY", "the interest rate before APR") doesn't count."""
-        return {
+        metrics = {
             metric for metric, pattern in METRICS
             if any(not SET_ASIDE.search(question[: match.start()]) for match in pattern.finditer(question))
         }
+        # "What rate and APR" asks for the rate beside the APR: the interest rate (the dividend rate beside an APY).
+        if RATE_AND_FIGURE.search(question):
+            metrics |= {"interest rate"} if "APR" in metrics else {"dividend rate"} if "APY" in metrics else set()
+        return metrics
 
     def conflicts(self, reported: set) -> list[Conflict]:
         """Report tiers that different pages publish with different values, resolved by page rank.

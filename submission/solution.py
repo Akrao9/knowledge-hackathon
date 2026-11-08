@@ -161,12 +161,24 @@ EXACT_FIGURE = re.compile(
     re.IGNORECASE,
 )
 FIGURE = re.compile(r"\d+(?:[.,]\d+)*")
+# A question asking what something is called ("What is the service called?", "Which business service ...?").
+NAME_QUESTION = re.compile(
+    r"\b(?:called|name of|what(?:'s| is) the name)\b"
+    r"|\bwhich (?:\w+ ){0,3}(?:service|tool|feature|program|product|account|card|app)\b",
+    re.IGNORECASE,
+)
 # A fee rule ("$10.00 or 3.00% of the amount of each cash advance, whichever is greater") worked out for the
 # amounts a question gives ("a $200 cash advance and a separate $500 cash advance").
 FEE_RULE = re.compile(
     r"\$\s?(\d[\d,]*(?:\.\d+)?)\s+or\s+(\d+(?:\.\d+)?)%\s+of\b[^.]*?\bwhichever is (greater|less)", re.IGNORECASE
 )
 DOLLARS = re.compile(r"\$\s?(\d[\d,]*(?:\.\d+)?)")
+# "foreign transaction fee-1.00% of each transaction": a fee that is a straight percentage of the amount.
+PERCENT_FEE = re.compile(
+    r"(?P<label>[A-Za-z][A-Za-z \-]{2,40}?)\s*[-–:]\s*(?P<percent>\d+(?:\.\d+)?)%\s+of\s+(?:each|the|a|any)\b"
+)
+ROUND_UP = re.compile(r"\bround\w*\b[^.]{0,80}?\bup to the next dollar", re.IGNORECASE)
+FEE_WORDS = frozenset({"fee", "fees", "charge", "charges", "cost", "costs"})
 NO_FIGURE_ANSWER = "I don't know the exact figure. Dupaco's website doesn't publish it; the closest passage says:"
 COMPARISON = re.compile(
     r"\bcompare\b|\b(?:all|every|each)\b.{0,100}\b(?:same|identical)\b|\b(?:same|identical)\b.{0,60}\b(?:all|every|each)\b"
@@ -184,6 +196,7 @@ class Section:
     heading_path: tuple[str, ...]
     text: str
     link_target: Optional[str] = None
+    kicker: str = ""  # a small heading right above this section's heading ("POSITIVE PAY" over "Stop Fraud Before It Starts")
 
 
 def _singular(word: str) -> str:
@@ -284,6 +297,21 @@ def _markdown_sections(markdown: str) -> Iterator[tuple[tuple[str, ...], str]]:
     text = "\n".join(lines[start:]).strip("\n")
     if text.strip():
         yield tuple(title for _, title in headings), text
+
+
+def _kickers(markdown: str) -> dict[str, str]:
+    """Headings labelled by a smaller heading directly above them, with nothing between.
+
+    Pages put a product name in a small heading over a slogan ("##### POSITIVE PAY" over "## Stop Fraud Before It
+    Starts"); the section belongs to the slogan heading, so the name is kept beside it for answers that need it.
+    """
+    lines = markdown.splitlines()
+    headings = sorted(markdown_blocks.parse(markdown).headings.items())
+    return {
+        title: kicker
+        for (line, (level, kicker)), (next_line, (next_level, title)) in zip(headings, headings[1:])
+        if next_level < level and not any(text.strip() for text in lines[line + 1:next_line])
+    }
 
 
 def _search_sections(markdown: str, path: str) -> Iterator[tuple[tuple[str, ...], str, str]]:
@@ -417,6 +445,9 @@ def _quote_answer(question: str, evidence: list[tuple[Section, str]], limit: Opt
         seen.add(key)
         if section.link_target and section.link_target not in quote:
             quotes.append(f"[View page]({section.link_target})")
+        elif NAME_QUESTION.search(question) and _section_name(section):
+            # A question asking what something is called gets the name the page gives the section.
+            quotes.append(f"{_section_name(section)}: {shown}")
         elif places > 1 and section.heading_path:
             # Each place's passage is named by the title of the page it comes from.
             quotes.append(f"{section.heading_path[0]}: {shown}")
@@ -428,16 +459,49 @@ def _quote_answer(question: str, evidence: list[tuple[Section, str]], limit: Opt
     return Answer(text="\n\n".join(quotes), sources=sources)
 
 
-def _with_fee_amounts(question: str, answer: Answer) -> Answer:
-    """Add what a quoted "$X or Y% of the amount, whichever is greater" fee comes to for each amount asked about."""
-    rule = FEE_RULE.search(answer.text) if answer.confident else None
+def _with_worked_amounts(question: str, answer: Answer) -> Answer:
+    """Work a quoted rule out for the dollar amounts the question gives.
+
+    Three published forms are handled: a fee of "$X or Y% of the amount, whichever is greater", a fee of "Y% of
+    each transaction", and rounding purchases "up to the next dollar". A fee rule counts only when its own words
+    share a word with the question (other than "fee"), so a foreign-purchase question isn't given the cash-advance fee.
+    """
     amounts = [Decimal(amount.replace(",", "")) for amount in DOLLARS.findall(question)]
-    if not rule or not amounts:
+    if not answer.confident or not amounts:
         return answer
-    flat, percent = Decimal(rule[1].replace(",", "")), Decimal(rule[2])
-    pick = max if rule[3].lower() == "greater" else min
-    worked = "; ".join(f"${amount:,.2f}: ${pick(flat, amount * percent / 100):,.2f}" for amount in amounts)
+    asked = _rank_terms(question) - FEE_WORDS
+    worked = ""
+    for rule in FEE_RULE.finditer(answer.text):
+        context = answer.text[max(0, rule.start() - 60):rule.end()]
+        if asked & _rank_terms(context):
+            flat, percent = Decimal(rule[1].replace(",", "")), Decimal(rule[2])
+            pick = max if rule[3].lower() == "greater" else min
+            worked = "; ".join(f"${amount:,.2f}: ${pick(flat, amount * percent / 100):,.2f}" for amount in amounts)
+            break
+    else:
+        for rule in PERCENT_FEE.finditer(answer.text):
+            if asked & _rank_terms(rule["label"]):
+                percent = Decimal(rule["percent"])
+                worked = "; ".join(f"${amount:,.2f}: ${amount * percent / 100:,.2f}" for amount in amounts)
+                break
+        else:
+            if ROUND_UP.search(MARKDOWN_LINK.sub(lambda link: link[1], answer.text)):
+                change = [(1 - amount % 1) % 1 for amount in amounts]
+                if any(change):
+                    parts = "; ".join(f"${amount:,.2f} rounds up ${up:,.2f}" for amount, up in zip(amounts, change))
+                    worked = f"{parts}; total ${sum(change):,.2f}" if len(amounts) > 1 else parts
+    if not worked:
+        return answer
     return replace(answer, text=f"{answer.text}\n\nWorked out for the amounts asked about: {worked}.")
+
+
+def _section_name(section: Section) -> str:
+    """The section's kicker, else its own heading, when it is a plain name (no number or link)."""
+    for name in (section.kicker, section.heading_path[-1] if section.heading_path else ""):
+        name = name.strip("*# ")
+        if name and "](" not in name and not any(char.isdigit() for char in name):
+            return name
+    return ""
 
 
 def _figures(text: str) -> set[str]:
@@ -644,6 +708,7 @@ class SnapshotKnowledge:
             page_terms = _rank_terms(f"{page.title} {page_path}")
             path = page_path.rstrip("/")
             scale = ARTICLE_WEIGHT if _is_article(page.url) else 1
+            kickers = _kickers(page.markdown)
             for headings, text, label in _search_sections(page.markdown, path):
                 if _is_teaser(page.url, headings, text):
                     continue
@@ -656,6 +721,7 @@ class SnapshotKnowledge:
                     page_title=page.title,
                     heading_path=heading_path,
                     text=text,
+                    kicker=kickers.get(headings[-1], "") if headings else "",
                 )
                 sections[section_id] = section
                 links.extend(_navigation_sections(section))
@@ -742,7 +808,7 @@ class SnapshotKnowledge:
         key = (question, as_of)
         if key not in self._answers:
             answer = self._answer(question, as_of)
-            answer = _with_fee_amounts(question, answer)
+            answer = _with_worked_amounts(question, answer)
             if answer.confident and EXACT_FOR_MEMBER.search(question) and VARIES.search(answer.text):
                 answer = replace(answer, text=f"{VARIES_ANSWER}\n\n{answer.text}", confident=False)
             elif answer.confident and EXACT_FIGURE.search(question) and not _figures(answer.text) - _figures(question):
